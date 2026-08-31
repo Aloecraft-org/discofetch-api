@@ -14,12 +14,36 @@ coincidence: see [Provenance](#provenance).
 
 ## Consuming it
 
+**Today**, straight from GitHub. The repo carries no `index.json.sig` yet
+(see [Publishing](#publishing)), and `require_signatures` — which `dollup
+init` sets — binds network sources, so it has to come off for an unsigned
+one:
+
+```sh
+dollup init
+sed -i 's/"require_signatures": true/"require_signatures": false/' dollup.json
+dollup source add git+https://github.com/Aloecraft-org/disco-fetchpoint
+dollup add discofetch-api        # → discofetch-api 0.1.0, unsigned
+dollup verify                    # → clean
+```
+
+That resolves the repo's default branch. `zip+https://…/archive/refs/heads/<branch>.zip`
+works the same way.
+
+**Once the index is signed** — which is the state to want, because turning
+the check off for a network source is turning off the thing that makes it
+safe to fetch:
+
 ```sh
 dollup init
 dollup source add https://dollup.aloecraft.org/disco-fetchpoint/ \
   --key ed25519:SVJvQTvveNjYy6r9wtqPIzf5UQ3JNuOYSUmlneMjMlo=
 dollup add discofetch-api
 ```
+
+The `https://` host serves the rsynced tree and does not exist yet; the
+`git+https` line above needs nothing served at all, which is why it is the
+one that works now.
 
 Three files arrive and nothing runs:
 
