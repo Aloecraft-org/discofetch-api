@@ -1,0 +1,19 @@
+# A projection of the package tree that publish.sh regenerates from empty.
+# Committing it would store every byte twice, and a blob from a deleted
+# package would go on being served under a name nothing indexes.
+blobs/
+
+# The staging tree publish.sh assembles before it rsyncs.
+.publish/
+
+# Keys are never in a repository. A key in a git repo is not a key.
+*.key
+*.key.pub
+*.pub
+
+# A local deployment made while trying the package out.
+code/
+dollup.json
+dollup.lock
+.dollup/
+data/
