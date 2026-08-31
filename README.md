@@ -16,7 +16,8 @@ coincidence: see [Provenance](#provenance).
 
 ```sh
 dollup init
-dollup source add https://dollup.aloecraft.org/disco-fetchpoint/ --key ed25519:…
+dollup source add https://dollup.aloecraft.org/disco-fetchpoint/ \
+  --key ed25519:SVJvQTvveNjYy6r9wtqPIzf5UQ3JNuOYSUmlneMjMlo=
 dollup add discofetch-api
 ```
 
@@ -180,12 +181,20 @@ override.
 directly, and without an index in it there is no repo to read. It is
 deterministic (hashes and paths only), so it diffs cleanly.
 
-`index.json.sig` is **not** committed yet, for the reason dollup's own
-std-repo gives: it would have to be signed with a key that does not exist.
-Once the real key is minted, commit the signature beside the index so the git
-and zipball sources verify the same way a mirror does.
+The repo's public key — the one in the `source add` line above, and the only
+half that belongs anywhere near a repository:
 
-Until then, add this repo as a source **without** `--key`. `dollup init`
+```
+ed25519:SVJvQTvveNjYy6r9wtqPIzf5UQ3JNuOYSUmlneMjMlo=
+```
+
+`index.json.sig` is **not committed here yet**, and it cannot be produced from
+this repository: it is written by `repo sign` on the machine holding the
+private half. Commit it from there, beside the index, so the git and zipball
+sources verify the same way a mirror does — that is the whole point of the
+signature living in the tree rather than in a transport.
+
+Until it lands, add this repo as a source **without** `--key`. `dollup init`
 writes `require_signatures: true`, but that rule is for *network* sources —
 `file://` is exempt by design, so an unsigned local or rsynced copy resolves
 fine. Pinning a key against a tree that carries no signature is refused, which
