@@ -36,7 +36,30 @@ head -c 32 /dev/urandom > data/crypto.key && chmod 600 data/crypto.key
 drt run reference/fetchpoint.host.lua
 ```
 
-The four connectors the program needs wired — `sql`, `crypto`, `time`, and a
+### Keep the flat connector spelling
+
+Two spellings of a connector's scope exist and only one works from Lua. This
+file already has the right one — it is discofetch's, and it is what runs on
+fetch1 — so the trap is only in *editing* it:
+
+```lua
+-- CORRECT, and what is below: the C host's flat shape, which DRT also takes
+sql = { scope = "/var/lib/discofetch", access = "readwrite", create = false },
+```
+
+```lua
+-- WRONG from a .host.lua. This is DRT's JSON form, and from Lua it fails:
+--   'host:fs': scope does not parse: invalid type: map, expected path string
+sql = { scope = { scope = "/var/lib/discofetch", access = "readwrite" } },
+```
+
+The nested form is valid in a **JSON** config and invalid in a **`.host.lua`**,
+so do not hand-translate DRT's `examples/deployment.json` into Lua. And
+`access` is `"read"` or `"readwrite"` — never `"readonly"`.
+
+### The connectors
+
+The four the program needs wired — `sql`, `crypto`, `time`, and a
 `listen` listener on the `http_in`/`http_out` queue pair. They are named here
 rather than in the manifest's `requires.connectors` because that field wants a
 call-shape version per connector and none is published yet; see the root
