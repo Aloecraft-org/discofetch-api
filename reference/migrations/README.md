@@ -2,7 +2,7 @@
 
 > Copied from discofetch `api/migrations/`. It says `supervisor.lua`; in this
 > repo that file is the package's guest module,
-> `packages/fetchpoint/0.1.0/guest/fetchpoint.dlua` — the same bytes under the
+> `packages/discofetch-api/0.1.0/guest/api.dlua` — the same bytes under the
 > extension the dollup format uses for a guest face.
 
 Numbered `.sql` files, applied in order at startup, recorded in

@@ -4,7 +4,7 @@ Not part of the package. Nothing here is delivered by `dollup add` — these are
 the two things an operator needs beside the code and neither belongs inside a
 package.
 
-## `fetchpoint.host.lua` — the deployment
+## `discofetch-api.host.lua` — the deployment
 
 A working DRT config for the delivered package, copied from discofetch's
 `api/api.dev.host.lua` with one line changed: `supervisor` names what dollup
@@ -33,7 +33,7 @@ mkdir -p data
 python3 -c "import sqlite3;c=sqlite3.connect('data/discofetch.sqlite');\
             c.execute('PRAGMA journal_mode=WAL');c.close()"
 head -c 32 /dev/urandom > data/crypto.key && chmod 600 data/crypto.key
-drt run reference/fetchpoint.host.lua
+drt run reference/discofetch-api.host.lua
 ```
 
 ### Keep the flat connector spelling

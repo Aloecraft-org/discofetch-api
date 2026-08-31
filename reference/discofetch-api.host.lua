@@ -28,7 +28,7 @@
 ---know what port it is on and cannot bind one.
 ---@type diluvium.HostConfig
 return {
-  supervisor = "code/fetchpoint/guest/fetchpoint.dlua",
+  supervisor = "code/discofetch-api/guest/api.dlua",
 
   -- sql and time both have a consumer now: the migration runner and /v1/me.
   -- `time` is easy to forget and is not part of sql -- created_at is NOT

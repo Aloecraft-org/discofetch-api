@@ -17,7 +17,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-vendored="$here/packages/fetchpoint/0.1.0/guest/fetchpoint.dlua"
+vendored="$here/packages/discofetch-api/0.1.0/guest/api.dlua"
 upstream="${DISCOFETCH:-$here/../discofetch}"
 update=0
 
@@ -50,14 +50,14 @@ echo "  vendored: $(sha256sum "$vendored" | cut -c1-16)…"
 [ "$update" = 1 ] || {
     echo
     echo "pass --update to take the upstream copy, then re-seal:"
-    echo "  dollup repo seal packages/fetchpoint/0.1.0 && dollup repo index ."
+    echo "  dollup repo seal packages/discofetch-api/0.1.0 && dollup repo index ."
     exit 1
 }
 
 cp "$src" "$vendored"
 echo
 echo "updated. Now re-seal, or the manifest ships a stale hash:"
-echo "  dollup repo seal packages/fetchpoint/0.1.0"
+echo "  dollup repo seal packages/discofetch-api/0.1.0"
 echo "  dollup repo index ."
 echo
 echo "and bump the package version if this is going out to anyone."

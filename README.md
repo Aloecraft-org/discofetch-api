@@ -3,7 +3,7 @@
 The FetchPoint program, packaged for [dollup](https://github.com/Aloecraft-org/dollup).
 
 This repository is a **dollup repo**: an index, a signature and a package
-tree. It carries one package, `fetchpoint`, whose guest face is the
+tree. It carries one package, `discofetch-api`, whose guest face is the
 [Diluvium](https://github.com/Aloecraft-org/diluvium) program that serves the
 discofetch API and every FetchPoint on it — accounts, labels, tokens, the kind
 registry, the rendezvous surface, quotas and traffic.
@@ -17,25 +17,25 @@ coincidence: see [Provenance](#provenance).
 ```sh
 dollup init
 dollup source add https://dollup.aloecraft.org/disco-fetchpoint/ --key ed25519:…
-dollup add fetchpoint
+dollup add discofetch-api
 ```
 
 Three files arrive and nothing runs:
 
 ```
-code/fetchpoint/manifest.json
-code/fetchpoint/guest/fetchpoint.dlua
+code/discofetch-api/manifest.json
+code/discofetch-api/guest/api.dlua
 dollup.lock
 ```
 
 Installing never grants. What the program may do lives in your DRT config, and
 writing that config is yours — dollup does not write it and neither does this
-repo. [`reference/fetchpoint.host.lua`](reference/fetchpoint.host.lua) is a
+repo. [`reference/discofetch-api.host.lua`](reference/discofetch-api.host.lua) is a
 working example to copy and edit; [`reference/README.md`](reference/README.md)
 says which lines a real deployment always changes.
 
 ```sh
-drt run reference/fetchpoint.host.lua     # after editing the scopes
+drt run reference/discofetch-api.host.lua     # after editing the scopes
 curl -s localhost:8080/health
 ```
 
@@ -43,11 +43,15 @@ curl -s localhost:8080/health
 
 | | |
 |---|---|
-| name | `fetchpoint` |
+| name | `discofetch-api` |
 | version | `0.1.0` |
 | faces | guest only |
-| entry module | `fetchpoint` → `guest/fetchpoint.dlua` |
+| entry module | `api` → `guest/api.dlua` |
 | runnable | yes |
+
+The package name is what the program already calls itself: `GET /health`
+answers `{"service":"discofetch-api"}`. Keeping the two in step means a
+running process and the package it was installed from say the same word.
 
 ```json
 "requires": {
@@ -127,7 +131,7 @@ FetchPoint guests.
 
 ## Provenance
 
-`packages/fetchpoint/0.1.0/guest/fetchpoint.dlua` is `sha256` identical to
+`packages/discofetch-api/0.1.0/guest/api.dlua` is `sha256` identical to
 discofetch's `api/supervisor.lua` at the commit it was taken from. The only
 change is the filename, because the dollup format's guest face uses `.dlua`.
 
@@ -201,8 +205,8 @@ signature travels with the tree, so signing once covers all four transports.
 ## Changing the package
 
 ```sh
-$EDITOR packages/fetchpoint/0.1.0/guest/fetchpoint.dlua   # (but see Provenance)
-dollup repo seal packages/fetchpoint/0.1.0                # rehash, rewrite `files`
+$EDITOR packages/discofetch-api/0.1.0/guest/api.dlua   # (but see Provenance)
+dollup repo seal packages/discofetch-api/0.1.0                # rehash, rewrite `files`
 dollup repo index .                                       # re-index, independently
 ```
 
@@ -214,7 +218,7 @@ consumer's requirement picks one.
 ## Verified
 
 On **both runtimes**, from the package as dollup delivers it — resolved into a
-deployment, then started from `code/` with `reference/fetchpoint.host.lua`:
+deployment, then started from `code/` with `reference/discofetch-api.host.lua`:
 
 - **DRT 0.1.0** (`drt --config … start`), which is what fetch1 runs — binary
   from the published release, sha256 checked against its `SHA256SUMS.txt`
@@ -222,7 +226,7 @@ deployment, then started from `code/` with `reference/fetchpoint.host.lua`:
 
 Identical results on both:
 
-- `dollup add fetchpoint` → materialized; `dollup verify` → clean
+- `dollup add discofetch-api` → materialized; `dollup verify` → clean
 - the delivered module is `sha256` identical to upstream `api/supervisor.lua`
 - it starts, migrations apply, `GET /health` → `200 {"db":"ready"}`
 - refusals are real: `404 no_route`, `401 unauthenticated`

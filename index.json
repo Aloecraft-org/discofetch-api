@@ -2,13 +2,13 @@
   "dollup_repo": 1,
   "hash": "sha256",
   "packages": {
-    "fetchpoint": {
+    "discofetch-api": {
       "versions": {
         "0.1.0": {
-          "path": "packages/fetchpoint/0.1.0",
-          "manifest": "sha256:1f1dc06ca879fed7f25e3f503cdd3ce9148b878c15377b57167fe3b0f8600b32",
-          "package_id": "sha256:f5b7e9265a23af61afc921dfac8b5659b46d4022604b3bf0e6c88207d23170c5",
-          "code_set": "sha256:88ad858f7222b05a12822adab3adbee4c982be7248a8178c0280209b2178aba4",
+          "path": "packages/discofetch-api/0.1.0",
+          "manifest": "sha256:beee438e60e8af0079d3cf488e53d13b4730db3964c95180e1362ef632aa746a",
+          "package_id": "sha256:2ffeed3845a6b99dd0e6f692d55b67e7f4fb0312760f5ecae8dd5f7f047012d4",
+          "code_set": "sha256:323c61dc1feb1ac128ae4cf3a435265d9aab1c0304a68005f576a654827d8260",
           "faces": [
             "guest"
           ],

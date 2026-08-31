@@ -1,10 +1,10 @@
 {
-  "name": "fetchpoint",
+  "name": "discofetch-api",
   "version": "0.1.0",
   "guest": {
-    "main": "fetchpoint",
+    "main": "api",
     "modules": {
-      "fetchpoint": "guest/fetchpoint.dlua"
+      "api": "guest/api.dlua"
     },
     "source_only": true
   },
@@ -18,6 +18,6 @@
     "diluvium": ">=5.5.1"
   },
   "files": {
-    "guest/fetchpoint.dlua": "sha256:3a3bd6a2ac0ef45e1ac4d40374d246c338c3787ba21b5011b0137b1139679bcb"
+    "guest/api.dlua": "sha256:3a3bd6a2ac0ef45e1ac4d40374d246c338c3787ba21b5011b0137b1139679bcb"
   }
 }
