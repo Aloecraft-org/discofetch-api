@@ -1,4 +1,4 @@
-# disco-fetchpoint
+# discofetch-api
 
 The FetchPoint program, packaged for [dollup](https://github.com/Aloecraft-org/dollup).
 
@@ -8,9 +8,13 @@ tree. It carries one package, `discofetch-api`, whose guest face is the
 discofetch API and every FetchPoint on it — accounts, labels, tokens, the kind
 registry, the rendezvous surface, quotas and traffic.
 
-The code is extracted from [discofetch-api](https://github.com/Aloecraft-org/discofetch-api)
+The code is extracted from [discofetch](https://github.com/Aloecraft-org/discofetch)
 `api/supervisor.lua`, **byte for byte**. That is the discipline, not a
 coincidence: see [Provenance](#provenance).
+
+**New here?** [`doc/FETCHPOINT-TYPES.md`](doc/FETCHPOINT-TYPES.md) is the list of
+what a FetchPoint can be — seven kinds, what each one answers, and what config
+each takes. It also says plainly which do not exist yet.
 
 ## Consuming it
 
@@ -22,7 +26,7 @@ one:
 ```sh
 dollup init
 sed -i 's/"require_signatures": true/"require_signatures": false/' dollup.json
-dollup source add git+https://github.com/Aloecraft-org/disco-fetchpoint
+dollup source add git+https://github.com/Aloecraft-org/discofetch-api
 dollup add discofetch-api        # → discofetch-api 0.1.0, unsigned
 dollup verify                    # → clean
 ```
@@ -36,7 +40,7 @@ safe to fetch:
 
 ```sh
 dollup init
-dollup source add https://dollup.aloecraft.org/disco-fetchpoint/ \
+dollup source add https://dollup.aloecraft.org/discofetch-api/ \
   --key ed25519:SVJvQTvveNjYy6r9wtqPIzf5UQ3JNuOYSUmlneMjMlo=
 dollup add discofetch-api
 ```
@@ -165,8 +169,8 @@ Byte-identity is worth keeping. It turns "has this fork drifted?" into a
 an API that already exists and is deployed:
 
 ```sh
-./sync-from-discofetch.sh --from ../discofetch-api     # report drift
-./sync-from-discofetch.sh --from ../discofetch-api --update
+./sync-from-discofetch.sh --from ../discofetch     # report drift
+./sync-from-discofetch.sh --from ../discofetch --update
 ```
 
 Edits belong upstream and arrive here through that script. Wanting to patch
