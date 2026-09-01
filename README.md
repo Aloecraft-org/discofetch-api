@@ -8,7 +8,7 @@ tree. It carries one package, `discofetch-api`, whose guest face is the
 discofetch API and every FetchPoint on it — accounts, labels, tokens, the kind
 registry, the rendezvous surface, quotas and traffic.
 
-The code is extracted from [discofetch](https://github.com/Aloecraft-org/discofetch)
+The code is extracted from [discofetch-api](https://github.com/Aloecraft-org/discofetch-api)
 `api/supervisor.lua`, **byte for byte**. That is the discipline, not a
 coincidence: see [Provenance](#provenance).
 
@@ -165,8 +165,8 @@ Byte-identity is worth keeping. It turns "has this fork drifted?" into a
 an API that already exists and is deployed:
 
 ```sh
-./sync-from-discofetch.sh --from ../discofetch     # report drift
-./sync-from-discofetch.sh --from ../discofetch --update
+./sync-from-discofetch.sh --from ../discofetch-api     # report drift
+./sync-from-discofetch.sh --from ../discofetch-api --update
 ```
 
 Edits belong upstream and arrive here through that script. Wanting to patch

@@ -18,7 +18,15 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 vendored="$here/packages/discofetch-api/0.1.0/guest/api.dlua"
-upstream="${DISCOFETCH:-$here/../discofetch}"
+# The upstream repo was renamed discofetch -> discofetch-api; a local
+# checkout may sit under either name, so try the new one and fall back.
+upstream="${DISCOFETCH:-}"
+if [ -z "$upstream" ]; then
+    for cand in "$here/../discofetch-api" "$here/../discofetch"; do
+        [ -r "$cand/api/supervisor.lua" ] && { upstream="$cand"; break; }
+    done
+    upstream="${upstream:-$here/../discofetch-api}"
+fi
 update=0
 
 while [ $# -gt 0 ]; do
