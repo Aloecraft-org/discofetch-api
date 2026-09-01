@@ -18,7 +18,7 @@ The lines a real deployment always edits:
 
 | line | why |
 |---|---|
-| `sql.scope` | `data/` is relative to the host's cwd. Fine locally; wrong for a service — fetch1 uses an absolute path that systemd's `StateDirectory=` creates before `ExecStart`. |
+| `sql.scope` | `data/` is relative to the host's cwd. Fine locally; wrong for a service — use an absolute path that systemd's `StateDirectory=` creates before `ExecStart`. |
 | `crypto.key_file` | Must exist and hold at least 16 bytes, or the connector refuses to open and the deployment does not start. The host derives two subkeys and forgets the master; the guest never sees any of it. |
 | `listen.port` | Host topology. The program does not know what port it is on and cannot bind one. |
 | `supervisor` | Correct for the default code root (`code/`). If `dollup.json` names another, this must match. |
@@ -39,8 +39,8 @@ drt run reference/discofetch-api.host.lua
 ### Keep the flat connector spelling
 
 Two spellings of a connector's scope exist and only one works from Lua. This
-file already has the right one — it is discofetch's, and it is what runs on
-fetch1 — so the trap is only in *editing* it:
+file already has the right one — it is discofetch's, and it is what runs in
+production — so the trap is only in *editing* it:
 
 ```lua
 -- CORRECT, and what is below: the C host's flat shape, which DRT also takes

@@ -90,7 +90,7 @@ running process and the package it was installed from say the same word.
 ```
 
 Those four names are exactly `api.host.lua`'s `caps` line in discofetch — the
-ceiling fetch1 serves production with, so the one the program is *known* to
+ceiling its production deployment serves with, so the one the program is *known* to
 run under.
 
 **Nothing enforces this field today.** It is declarative: `dollup info` prints
@@ -257,7 +257,8 @@ consumer's requirement picks one.
 On **both runtimes**, from the package as dollup delivers it — resolved into a
 deployment, then started from `code/` with `reference/discofetch-api.host.lua`:
 
-- **DRT 0.1.0** (`drt --config … start`), which is what fetch1 runs — binary
+- **DRT 0.1.0** (`drt --config … start`), which is what discofetch runs in
+  production — binary
   from the published release, sha256 checked against its `SHA256SUMS.txt`
 - **diluvium-host 5.5.1_build11**, the C host
 
