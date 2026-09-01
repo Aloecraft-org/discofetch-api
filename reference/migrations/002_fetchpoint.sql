@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS fetchpoint (
   kind              TEXT    NOT NULL,
 
   config            TEXT    NOT NULL DEFAULT '{}',   -- kind-specific JSON
-  host              TEXT    NOT NULL DEFAULT 'fetch1',  -- so fetch2 is possible
+  host              TEXT    NOT NULL DEFAULT 'fetch1',  -- so a second is possible
   created_at        INTEGER NOT NULL,
   updated_at        INTEGER NOT NULL,
   deleted_at        INTEGER                -- soft delete; the label survives it

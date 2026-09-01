@@ -169,7 +169,7 @@ local MIGRATIONS = {
       -- by the rendezvous dns verb OBSERVING a caller, and is what the
       -- DNS publisher (and one day the nameserver) reads. Different write
       -- paths, different tables -- and a new table needs no ALTER, which
-      -- matters because migrations 1-4 are frozen on fetch1 and SQLite
+      -- matters because migrations 1-4 are frozen once run and SQLite
       -- has no idempotent ADD COLUMN.
       [[CREATE TABLE IF NOT EXISTS advertisement (
           fetchpoint_id  INTEGER PRIMARY KEY REFERENCES fetchpoint(id),
@@ -228,7 +228,7 @@ local MIGRATIONS = {
       -- The prelaunch mechanism, and BOTH tables land together on purpose.
       -- Only `account_grant` has a reader in this slice; `invite` has none
       -- yet. They share a version anyway because a version that has run on
-      -- fetch1 can never be edited afterwards, so splitting them would cost
+      -- a deployment can never be edited afterwards, so splitting them would cost
       -- the invite slice a migration 8 for a table whose text is already
       -- settled -- and the two are one design (an invite CONFERS grants;
       -- redeeming one writes rows in the other).
@@ -440,7 +440,7 @@ end
 -- reflect.discofetch.link is a real FetchPoint: an ordinary row owned by
 -- the system account, created here idempotently, never special-cased in
 -- dispatch. If the product cannot host its own reflect, the product is
--- wrong -- and once the zone points at gate1 this row is the permanent
+-- wrong -- and once the zone points at the edge this row is the permanent
 -- end-to-end canary: reflect answering means DNS, the edge, the hub, the
 -- listener and the database all work. 'reflect' cannot collide with a
 -- generated label (wrong length, and no random draw produces it) and no
@@ -526,7 +526,7 @@ local function fail(conn, status, code, message, headers)
   reply(conn, status, { error = { code = code, message = message } }, headers)
 end
 
--- The edge's observation of the caller. x-real-ip first: gate1 SETS it
+-- The edge's observation of the caller. x-real-ip first: the edge SETS it
 -- from the connection it terminated, so it has exactly one writer we own.
 -- The x-forwarded-for FIRST element is the fallback for paths without
 -- that edge (local runs, the api_in path) -- informational there, because
@@ -542,7 +542,7 @@ end
 -- x-forwarded-for-style fallback: no such convention exists for ports,
 -- and a guessed port is worse than none -- the consumer is a NAT
 -- diagnostic comparing mappings, and a wrong number there is a wrong
--- conclusion. Same one-writer construction as x-real-ip: gate1 sets it
+-- conclusion. Same one-writer construction as x-real-ip: the edge sets it
 -- from the connection it terminated.
 local function observed_port(req)
   local p = tonumber(req.real_port or '')
@@ -551,9 +551,10 @@ local function observed_port(req)
 end
 
 -- The public half of the relay chain. The raw x-forwarded-for names
--- every hop, and the inner ones map OUR topology -- the wg legs, dart1's
--- gateway address -- for anyone curious; production echoed 192.168.4.2
--- to the world until this. Private, CGNAT, loopback and link-local
+-- every hop, and the inner ones map the deployment's own topology -- its
+-- private legs and gateway addresses -- for anyone curious; a production
+-- deployment echoed an internal address to the world until this.
+-- Private, CGNAT, loopback and link-local
 -- entries are dropped from the public echo, and an empty result is nil
 -- rather than an empty string. The raw chain stays available to the
 -- owner via cfg.debug_forwarded, where debugging the path is the point.
@@ -965,8 +966,8 @@ local function waitlist_join(req, p)
   end
 
   -- Shed abuse before parsing it, twice over. The GLOBAL bucket first: on
-  -- the api path x-real-ip is only as trustworthy as cloud1 makes it
-  -- (deploy/dart1/README.md), so a rotated header must never mean
+  -- the api path x-real-ip is only as trustworthy as the fronting proxy
+  -- makes it, so a rotated header must never mean
   -- unlimited rows -- this cap bounds the table's growth absolutely, at a
   -- rate far above honest signups. Then per address: keyed by the edge's
   -- observation when one arrived, sized for a conference wifi where many
@@ -5578,7 +5579,7 @@ local function admin_stats(req, p)
 end
 
 -- What DNS should be publishing, right now. The nameserver's puller
--- reads this and reconciles gate1's zone against it -- so this endpoint
+-- reads this and reconciles the edge's zone against it -- so this endpoint
 -- is the authority and the zone is a cache of it, which is the ordering
 -- that makes a lost nameserver a rebuild rather than a data loss.
 --
@@ -5871,13 +5872,13 @@ while true do
       -- case-sensitive and "example.com" and "example.com:8080" address the
       -- same thing. Doing it here means no comparison below has to remember.
       host = (m.headers and m.headers.host or ''):lower():match('^([^:]*)') or '',
-      -- The edge's observation (x-real-ip, one writer we own -- gate1 SETS
-      -- it) and the informational relay chain. See api.host.lua.
+      -- The edge's observation (x-real-ip, one writer we own -- the edge
+      -- SETS it) and the informational relay chain. See api.host.lua.
       real_ip = m.headers and m.headers['x-real-ip'] or nil,
       forwarded = m.headers and m.headers['x-forwarded-for'] or nil,
       -- The NAT-observation pair (doc/REFLECT-NAT.md): the source port the
-      -- edge terminated, and WHICH edge -- constant while gate1 is the only
-      -- one, load-bearing the day fetch2 exists, because NAT mappings are
+      -- edge terminated, and WHICH edge -- constant while there is one
+      -- edge, load-bearing the day a second exists, because NAT mappings are
       -- per-destination and a caller on a two-IP name must know which
       -- vantage answered. Deliberately not x-df-*: that namespace is the
       -- stripped identity boundary, and these must survive the trip.
@@ -5942,7 +5943,7 @@ while true do
       elseif handler then
         -- Under pcall: a bug in one request answers 500 to that request,
         -- never takes the server down. The reason goes to stdout, which is
-        -- journald on fetch1 and the terminal under ./run.sh debug.
+        -- journald under systemd and the terminal under ./run.sh debug.
         local ok, status, payload, hdrs = pcall(handler, req, params)
         if not ok then
           print('handler error: ' .. m.method .. ' ' .. path .. ': ' .. tostring(status))
