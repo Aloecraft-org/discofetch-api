@@ -54,8 +54,22 @@ sql = { scope = { scope = "/var/lib/discofetch", access = "readwrite" } },
 ```
 
 The nested form is valid in a **JSON** config and invalid in a **`.host.lua`**,
-so do not hand-translate DRT's `examples/deployment.json` into Lua. And
-`access` is `"read"` or `"readwrite"` — never `"readonly"`.
+so do not hand-translate DRT's `examples/deployment.json` into Lua.
+
+**`access` spelling depends on which DRT you run**, and this is a real trap:
+
+| runtime | accepts | refuses |
+|---|---|---|
+| the C host (`dhost.c`), and DRT **0.4.0+** | `read`, `readwrite` | `readonly` |
+| DRT **0.3.0** | `readonly`, `readwrite` | `read` |
+
+DRT 0.3.0 had the spelling backwards, so a config written for the C host does
+not parse on it — a crash-loop under the deploy chain check, not a warning.
+0.4.0 matches `dhost.c` exactly, and a config edited to say `readonly` as a
+0.3.0 workaround has to be changed back.
+
+The config below sidesteps this entirely by using `readwrite`, which every
+version accepts. Only a read-only scope has to care.
 
 ### The connectors
 
