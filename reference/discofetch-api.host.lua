@@ -12,7 +12,7 @@
 ---
 ---The sql scope and the crypto key_file are the two lines a real deployment
 ---always edits. `data/` is relative to the host's cwd, which is fine for a
----local run and wrong for a service; fetch1 uses an absolute path that
+---local run and wrong for a service; a service uses an absolute path that
 ---systemd's StateDirectory= creates. A config runs with an empty environment
 --- -- "a config declares, it does not compute" -- so there is no variable to
 ---switch on: two deployments are two files.
@@ -121,7 +121,7 @@ return {
       --                  here that the client controls end to end: nothing
       --                  upstream verifies it, so it may select a
       --                  FetchPoint and must never confer authority.
-      --   x-real-ip      the EDGE'S observation of the caller: gate1 SETS
+      --   x-real-ip      the EDGE'S observation of the caller: the edge SETS
       --                  it from the connection it terminated, so unlike
       --                  x-forwarded-for (which proxies append to and a
       --                  client can seed) its value has one writer we own.

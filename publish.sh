@@ -2,7 +2,8 @@
 # Publish disco-fetchpoint as a dollup repo.
 #
 #   ./publish.sh --key-file ~/.dollup/disco-fetchpoint.key            # build + self-check
-#   ./publish.sh --key-file ~/.dollup/disco-fetchpoint.key --deploy   # and rsync
+#   ./publish.sh --key-file ~/.dollup/disco-fetchpoint.key \
+#                --deploy --target user@host:/srv/repo/            # and rsync
 #
 # Build is local and offline: seal, index, sign, project blobs, then resolve
 # the staged repo in a throwaway deployment. Deploy is one rsync of that tree.
@@ -12,7 +13,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 stage="${DOLLUP_STAGE:-$repo_root/.publish}"
-target="${DOLLUP_TARGET:-cloud1:/var/www/disco-fetchpoint/}"
+target="${DOLLUP_TARGET:-}"
 dollup="${DOLLUP_BIN:-}"
 key_file="${DOLLUP_KEY_FILE:-}"
 deploy=0
@@ -104,8 +105,14 @@ trap 'rm -rf "$tmp"' EXIT
 )
 
 if [ "$deploy" = 1 ]; then
+    # No default target, and the guard is not politeness: this rsync carries
+    # --delete, so an empty target is a footgun and not merely a no-op.
+    if [ -z "$target" ]; then
+        echo "--deploy needs a target: --target user@host:/path, or DOLLUP_TARGET" >&2
+        exit 2
+    fi
     echo "==> deploying to $target"
     rsync -avz --delete "$stage"/ "$target"
 else
-    echo "built in $stage — pass --deploy to rsync to $target"
+    echo "built in $stage — pass --deploy with --target to rsync it"
 fi

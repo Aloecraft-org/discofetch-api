@@ -36,11 +36,11 @@ writing the next one.
 The corollary: **a migration may be edited only while it has never been
 applied anywhere that matters.** `001` and `002` are in that state today —
 the runner exists (see below) and local test databases are created and
-thrown away by `./run.sh`, but no deployment on fetch1 has opened a real
+thrown away by `./run.sh`, but no production deployment has opened a real
 database yet. That editability is why `002` could absorb the
 live-rows-only unique index (`fetchpoint_label_live`) the day the
 soft-delete/label-reuse collision was found, rather than costing an `003`.
-The day fetch1 first runs, both freeze. The distinction matters here more
+The day a production deployment first runs, both freeze. The distinction matters here more
 than in most projects: SQLite has no `ADD COLUMN IF NOT EXISTS`, so an
 `ALTER` cannot be made idempotent, and idempotence is not optional when
 there are no transactions. After the freeze, the next change costs a
@@ -104,10 +104,10 @@ is part of the release, which is where factor V wants it anyway. These
 `STRICT` needs SQLite 3.37+, and **nothing in the runtime image supplies
 SQLite**: `diluvium-host` is built on alpine 3.20 and statically linked
 against `sqlite-static`, so it carries its own regardless of what the box
-has. That was load-bearing while fetch1 was Alpine 3.15, whose system
-sqlite is 3.36 — one release short of `STRICT`, so the CLI could not have
-read what the API wrote. On Debian 12 the box's own `sqlite3` is well past
-3.37 and the two agree, which makes hand-inspection work again.
+has. That matters on any host whose system sqlite predates 3.37 — Alpine
+3.15's is 3.36, one release short of `STRICT`, so the CLI could not have
+read what the API wrote. Where the host's own `sqlite3` is past 3.37 the
+two agree, which makes hand-inspection work again.
 
 The property is worth keeping even though the conflict is gone: the
 version the API sees is a property of the pinned release, not of the box,

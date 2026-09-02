@@ -11,7 +11,7 @@
 -- The prelaunch mechanism, and BOTH tables land in ONE version on
 -- purpose. Only `account_grant` has a reader today; `invite` has none
 -- yet. They share a version anyway because a version that has run on
--- fetch1 can never be edited afterwards, so splitting them would cost the
+-- a deployment can never be edited afterwards, so splitting them would cost the
 -- invite slice a migration 008 for a table whose text is already settled
 -- — and the two are one design: an invite CONFERS grants, and redeeming
 -- one writes rows in the other.

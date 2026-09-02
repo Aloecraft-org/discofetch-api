@@ -5,7 +5,7 @@
 -- rendezvous dns verb OBSERVING a caller (advertise-by-showing-up), and
 -- is what the DNS publisher — and one day the nameserver — reads.
 -- Different write paths, different tables. A new table also needs no
--- ALTER, which matters because migrations 1–4 are frozen on fetch1 and
+-- ALTER, which matters because migrations 1–4 are frozen once run and
 -- SQLite has no idempotent ADD COLUMN.
 
 CREATE TABLE IF NOT EXISTS advertisement (
