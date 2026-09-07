@@ -18,6 +18,6 @@
     "diluvium": ">=5.5.1"
   },
   "files": {
-    "guest/api.dlua": "sha256:28ebd46e3fcfb52d170586b2ccab499ca383d19acf957c16772105fa0d674004"
+    "guest/api.dlua": "sha256:5265926c40dd07a36f54f7659723f60aab9251c7e5f06e2a19f60272f87a1b0b"
   }
 }

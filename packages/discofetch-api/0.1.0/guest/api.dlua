@@ -395,6 +395,28 @@ local B32 = 'abcdefghijklmnopqrstuvwxyz234567'
 local LABEL_BYTES = 10          -- 80 bits, exactly 16 symbols, no remainder
 local ZONE = 'discofetch.link'
 
+-- ICE (doc/ICE.md): what the --ice verb hands an RTCPeerConnection. STUN
+-- is public and free; TURN is metered per name, which is why its URL
+-- sits here and its credential is minted per request, attributed to the
+-- label. The TURN name does not resolve yet -- it is the name the
+-- deployment WILL use -- and turn=true is refused on an open room at
+-- config time rather than at runtime by surprise.
+--
+-- One table, not seven locals: a Lua main chunk holds at most 200 locals
+-- and this file was within a handful of the limit. The host refuses to
+-- load past it -- "too many local variables (limit is 200)" -- which is a
+-- deploy-time failure with a compile-time cause, so keep new constants
+-- grouped.
+local ICE = {
+  STUN_URLS = { 'stun:stun1.' .. ZONE .. ':3478', 'stun:stun2.' .. ZONE .. ':3478' },
+  TURN_URLS = { 'turn:turn.' .. ZONE .. ':3478?transport=udp' },
+  TURN_TTL = 3600,            -- seconds a minted TURN credential lives
+  MAX_CANDIDATES = 12,        -- per peer, doc/ICE.md 3
+  MAX_CANDIDATE_BYTES = 256,  -- each, encoded
+  CAND_TYPES = { host = true, srflx = true, prflx = true, relay = true },
+  PATHS = { direct = true, relay = true, failed = true },
+}
+
 -- crypto/random answers in HEX and a guest has no base32, so the regrouping
 -- happens here: 8-bit bytes in, 5-bit symbols out. Ten bytes divides into
 -- sixteen symbols with nothing left over, which is why the length is ten.
@@ -696,7 +718,10 @@ local function traffic_bump(fp_id, field)
   local tr = TRAFFIC[fp_id]
   if not tr then
     tr = { reads = 0, dns_updates = 0, joins = 0,
-           denied = 0, rate_limited = 0 }
+           denied = 0, rate_limited = 0,
+           -- ICE: credentials handed out, and what peers REPORTED. Nothing
+           -- here is observed; the room read says silent for the rest.
+           ice = 0, turn = 0, direct = 0, relay_reported = 0, failed = 0 }
     TRAFFIC[fp_id] = tr
   end
   tr[field] = tr[field] + 1
@@ -712,7 +737,8 @@ end
 -- it, which is the honest answer to "what is being hit".
 local function traffic_totals()
   local totals = { reads = 0, dns_updates = 0, joins = 0,
-                   denied = 0, rate_limited = 0 }
+                   denied = 0, rate_limited = 0,
+                   ice = 0, turn = 0, direct = 0, relay_reported = 0, failed = 0 }
   local names = 0
   for _, tr in pairs(TRAFFIC) do
     names = names + 1
@@ -1509,8 +1535,17 @@ local KINDS = {
       { key = 'room_ttl', type = 'choice', choices = { 60, 300, 3600 },
         description = 'Seconds a candidate stays without re-joining. '
           .. 'Default 300. Presence, not history.' },
+      { key = 'ice', type = 'choice', choices = { false, true },
+        description = 'Serve the --ice verb (ice_servers for an '
+          .. 'RTCPeerConnection) and let a join carry ufrag, pwd and a '
+          .. 'candidate list, keyed by ufrag. Needs rooms.' },
+      { key = 'turn', type = 'choice', choices = { false, true },
+        description = 'Also hand out a TURN credential on --ice, minted '
+          .. 'per request and attributed to this name. Refused while '
+          .. 'room_auth is open: an anonymous credential spends your '
+          .. 'relay allowance for whoever asks.' },
     },
-    verbs = { dns = true, join = true },
+    verbs = { dns = true, join = true, ice = true, outcome = true },
   },
   ['system:redirect'] = {
     title = 'Redirect', implemented = true,
@@ -1575,6 +1610,19 @@ local function validate_config(kind, config)
   for _, f in ipairs(KINDS[kind].config_fields) do
     if f.required and config[f.key] == nil then
       return nil, 'config needs ' .. f.key .. ' for ' .. kind
+    end
+  end
+  -- Cross-field rules, which a per-field spec cannot say. Refused at
+  -- config time by name rather than at runtime by surprise (doc/ICE.md 4).
+  if kind == 'system:rendezvous' then
+    if config.ice == true and config.rooms ~= true then
+      return nil, 'ice needs rooms: the --ice verb and ufrag-keyed joins are what a room grows'
+    end
+    if config.turn == true and config.ice ~= true then
+      return nil, 'turn needs ice: the credential is handed out by the --ice verb'
+    end
+    if config.turn == true and config.room_auth == 'open' then
+      return nil, 'turn is refused on an open room: a TURN credential handed out anonymously spends your relay allowance for whoever asks'
     end
   end
   return config
@@ -1665,6 +1713,26 @@ local function fp_row(r)
     created_at = r.created_at,
     updated_at = r.updated_at,
   }
+end
+
+-- The list row's second half: enough to say what a name is FOR and
+-- whether it is working, without the config the list deliberately
+-- withholds (the advertise key lives there). `mode` is the non-secret
+-- shape of a rendezvous -- serve, rooms, the pin -- which is what decides
+-- the job it was created for; `advertised` is the same pair the owner's
+-- detail carries. A dashboard that has to GET every row to draw a dot
+-- is a dashboard that stops drawing dots at the tenth row.
+local function fp_row_status(r)
+  local out = fp_row(r)
+  if r.kind == 'system:rendezvous' and r.config then
+    local cfg = json.decode(r.config) or {}
+    out.mode = { serve = cfg.serve or 'json', rooms = cfg.rooms == true }
+    if cfg.address_override then out.mode.pinned = cfg.address_override end
+  end
+  if r.adv_address then
+    out.advertised = { address = r.adv_address, at = r.adv_at }
+  end
+  return out
 end
 
 -- Is this Host a FetchPoint address, and if so which one?
@@ -2012,7 +2080,11 @@ local function room_join(fp_id, room, ttl, capacity, cand, t)
     fpr[room] = {}
   end
   local rs = fpr[room]
-  local key = cand.address .. '#' .. tostring(cand.port or 0)
+  -- A peer-shaped entry (doc/ICE.md 3) is keyed by its ufrag: unique per
+  -- session by construction, and what the other side needs anyway. A
+  -- plain candidate keeps address#port, so a re-join refreshes it.
+  local key = cand.ufrag and ('u#' .. cand.ufrag)
+           or (cand.address .. '#' .. tostring(cand.port or 0))
   if not rs[key] then
     local n = 0
     for _ in pairs(rs) do n = n + 1 end
@@ -2104,6 +2176,28 @@ local function advertise(fp_id, addr, t)
 end
 
 local function serve_fetchpoint(conn, req, label, verb)
+  -- Two room helpers scoped here rather than beside room_join: the main
+  -- chunk is at Lua's 200-local limit (see ICE above), and nothing else
+  -- uses them.
+  local function room_get(fp_id, room, ttl, key, t)
+    room_prune(fp_id, room, ttl, t)
+    local rs = ROOMS[fp_id] and ROOMS[fp_id][room]
+    return rs and rs[key] or nil
+  end
+
+  -- One encoder for both shapes, because the join and the read must show
+  -- the same thing. A plain candidate encodes as it is. A peer carries an
+  -- ARRAY of candidates, spliced in by hand: json.encode of an empty Lua
+  -- table is an object, and a peer with no candidates yet must read as [].
+  local function room_entry_json(c)
+    if not c.ufrag then return json.encode(c) end
+    local cj = {}
+    for i, cand in ipairs(c.candidates or {}) do cj[i] = json.encode(cand) end
+    local head = json.encode({ ufrag = c.ufrag, pwd = c.pwd, name = c.name, at = c.at,
+                               observed = c.observed, outcome = c.outcome })
+    return head:sub(1, -2) .. ',"candidates":[' .. table.concat(cj, ',') .. ']}'
+  end
+
   if not db_ready then
     return fail(conn, 503, 'db_unavailable',
                 db_error or 'the database is not open')
@@ -2194,6 +2288,85 @@ local function serve_fetchpoint(conn, req, label, verb)
       return reply(conn, 200, out, NO_STORE)
     end
 
+    -- The ice verb (doc/ICE.md 4): one fetch, ready to paste into an
+    -- RTCPeerConnection. Behind the room's door, because the TURN
+    -- credential it may carry spends the owner's relay allowance.
+    if verb == 'ice' or verb == 'outcome' then
+      if cfg.ice ~= true then
+        return fail(conn, 400, 'ice_disabled',
+                    'this fetchpoint does not serve ice; PATCH config.ice')
+      end
+      local room = req.query.room or ''
+      if room == '' or not valid_room(room) then
+        return fail(conn, 400, 'bad_room',
+                    '?room= is required: 1-64 letters, digits, hyphens or underscores')
+      end
+      if not room_allowed(cfg, req) then
+        traffic_bump(row.id, 'denied')
+        local okf, waitf = rate_allow('authfail:' .. row.id, 30, 10)
+        if not okf then
+          return fail(conn, 429, 'rate_limited',
+            'too many refused attempts on this name; retry in ' .. waitf .. 's',
+            rate_headers(waitf))
+        end
+        return fail(conn, 403, 'not_allowed',
+                    'the room policy (' .. (cfg.room_auth or 'key') .. ') did not admit this request')
+      end
+      if verb == 'ice' then
+        local servers = { json.encode({ urls = ICE.STUN_URLS }) }
+        local expires
+        if cfg.turn == true then
+          -- Minted per request and attributed to the LABEL (doc/ICE.md 5):
+          -- labels are published names, so nothing leaks, and an
+          -- allocation that cannot be traced to a name cannot be metered.
+          local okt, cred = pcall(host.crypto.turn_credential, label, ICE.TURN_TTL)
+          if not okt or type(cred) ~= 'table' then
+            -- A room configured for TURN on a deployment that cannot mint
+            -- is a misconfiguration to surface, not to paper over with a
+            -- STUN-only answer that looks like success.
+            return fail(conn, 503, 'turn_unavailable',
+                        'this deployment cannot mint a TURN credential: ' .. tostring(cred))
+          end
+          servers[#servers + 1] = json.encode({ urls = ICE.TURN_URLS,
+            username = cred.username, credential = cred.password })
+          expires = cred.expires
+          traffic_bump(row.id, 'turn')
+        end
+        traffic_bump(row.id, 'ice')
+        return reply(conn, 200, '{"service":"ice","label":' .. json.encode(label)
+          .. ',"room":' .. json.encode(room)
+          .. ',"ice_servers":[' .. table.concat(servers, ',') .. ']'
+          .. (expires and (',"expires_at":' .. expires) or '') .. '}', PUBLIC_READ)
+      end
+      -- The outcome verb (doc/ICE.md 6): a peer says how it went. REPORTED,
+      -- not observed -- the room read counts it apart from silence -- and
+      -- keyed to a ufrag currently in the room, so a report at least comes
+      -- from behind the door. Nothing here tells two members apart.
+      local ufrag, path = req.query.ufrag, req.query.path
+      if type(ufrag) ~= 'string' or ufrag == '' then
+        return fail(conn, 400, 'bad_ufrag', 'ufrag is required')
+      end
+      if not ICE.PATHS[path] then
+        return fail(conn, 400, 'bad_path', 'path is one of direct, relay, failed')
+      end
+      local rtt
+      if req.query.rtt_ms and req.query.rtt_ms ~= '' then
+        rtt = tonumber(req.query.rtt_ms)
+        if not rtt or rtt < 0 or rtt > 60000 then
+          return fail(conn, 400, 'bad_rtt', 'rtt_ms is 0-60000')
+        end
+      end
+      local t = now()
+      local entry = room_get(row.id, room, cfg.room_ttl or 300, 'u#' .. ufrag, t)
+      if not entry then
+        return fail(conn, 404, 'no_such_peer', 'no peer with that ufrag is in this room')
+      end
+      entry.outcome = { path = path, rtt_ms = rtt, at = t }
+      traffic_bump(row.id, path == 'direct' and 'direct'
+                           or path == 'relay' and 'relay_reported' or 'failed')
+      return reply(conn, 200, { ufrag = ufrag, recorded = entry.outcome }, NO_STORE)
+    end
+
     -- The join verb: enter a room as a candidate. The address is observed
     -- (the same property dns leans on); the PORT may be supplied, because
     -- WireGuard needs one and this edge cannot observe UDP. Auth is the
@@ -2259,24 +2432,117 @@ local function serve_fetchpoint(conn, req, label, verb)
                     'a candidate name is at most 32 letters, digits, spaces, ., - or _')
       end
     end
+    -- The peer shape (doc/ICE.md 3): with ice on, a join may carry a
+    -- ufrag, a pwd and up to ICE.MAX_CANDIDATES candidates -- ufrag and
+    -- pwd as query fields or in a JSON body, candidates only in the body
+    -- ({ufrag, pwd, candidates:[{type, address, port, protocol?}]}). The
+    -- entry is keyed by ufrag, and `observed` -- the edge's own view -- is
+    -- the server-reflexive candidate we supply for free and the peer
+    -- cannot forge. Without a ufrag the join is the plain candidate it
+    -- always was, so a WireGuard caller sees no change.
+    -- A WireGuard peer's two facts ride on a plain candidate (doc/P2P-
+    -- CAPABILITY.md: the direct path). The public key is what the other
+    -- side configures; the tunnel address is what it routes to. Neither
+    -- fits in `name` (32 of [A-Za-z0-9 ._-]; a key is 44 of base64), so
+    -- they are fields, validated by shape: a key that is not 32 bytes of
+    -- base64 is a device nobody can reach, and refusing it here is the
+    -- last place the mistake is cheap.
+    local wg_pubkey, wg_address
+    if req.query.wg_pubkey and req.query.wg_pubkey ~= '' then
+      wg_pubkey = req.query.wg_pubkey
+      if #wg_pubkey ~= 44 or not wg_pubkey:match('^[%w+/]+=$') then
+        return fail(conn, 400, 'bad_wg_pubkey',
+                    'wg_pubkey is a WireGuard public key: 44 characters of base64 ending in =')
+      end
+    end
+    if req.query.wg_address and req.query.wg_address ~= '' then
+      wg_address = req.query.wg_address
+      if not valid_ip(wg_address) then
+        return fail(conn, 400, 'bad_wg_address', 'wg_address is the tunnel-side IP literal this peer holds')
+      end
+    end
+    -- A peer sending through a TURN allocation is reachable at the
+    -- relay, not where the edge observed it from -- the one case where
+    -- "the address is observed, never supplied" would publish an address
+    -- nobody can reach. `relay` is that endpoint, labelled as what it is
+    -- (the relay candidate of a plain peer; an ICE join says the same as
+    -- a candidate of type relay). `observed` still says where the request
+    -- came from, so nothing about the peer's location is hidden, and a
+    -- wrong relay address costs only the peer that supplied it.
+    local relay
+    if req.query.relay and req.query.relay ~= '' then
+      relay = req.query.relay
+      local rh, rp = relay:match('^(.+):(%d+)$')
+      if not rh or not valid_ip(rh) or tonumber(rp) < 1 or tonumber(rp) > 65535 then
+        return fail(conn, 400, 'bad_relay', 'relay is the host:port a TURN allocation gave this peer')
+      end
+    end
+    local entry = { address = addr, port = port, name = cname,
+                    wg_pubkey = wg_pubkey, wg_address = wg_address, relay = relay }
+    if cfg.ice == true then
+      local body = {}
+      if req.body and req.body ~= '' then
+        local okb, decoded = pcall(json.decode, req.body)
+        if not okb or type(decoded) ~= 'table' then
+          return fail(conn, 400, 'bad_json', 'the body is not a JSON object')
+        end
+        body = decoded
+      end
+      local ufrag = body.ufrag or req.query.ufrag
+      if ufrag ~= nil then
+        local pwd = body.pwd or req.query.pwd
+        if type(ufrag) ~= 'string' or #ufrag < 4 or #ufrag > 256 or not ufrag:match('^[%w+/]+$') then
+          return fail(conn, 400, 'bad_ufrag', 'ufrag is 4-256 characters of [A-Za-z0-9+/]')
+        end
+        if pwd ~= nil and (type(pwd) ~= 'string' or #pwd < 22 or #pwd > 256
+                           or not pwd:match('^[%w+/]+$')) then
+          return fail(conn, 400, 'bad_pwd', 'pwd is 22-256 characters of [A-Za-z0-9+/]')
+        end
+        local cands = body.candidates or {}
+        if type(cands) ~= 'table' then
+          return fail(conn, 400, 'bad_candidates', 'candidates must be an array')
+        end
+        if #cands > ICE.MAX_CANDIDATES then
+          return fail(conn, 400, 'too_many_candidates',
+                      'at most ' .. ICE.MAX_CANDIDATES .. ' candidates per peer')
+        end
+        local clean = {}
+        for i, c in ipairs(cands) do
+          if type(c) ~= 'table' or not valid_ip(c.address)
+             or type(c.port) ~= 'number' or c.port < 1 or c.port > 65535 or c.port % 1 ~= 0
+             or not ICE.CAND_TYPES[c.type]
+             or (c.protocol ~= nil and c.protocol ~= 'udp' and c.protocol ~= 'tcp') then
+            return fail(conn, 400, 'bad_candidate', 'candidate ' .. i
+              .. ' needs {type: host|srflx|prflx|relay, address, port, protocol?: udp|tcp}')
+          end
+          clean[i] = { type = c.type, address = c.address, port = c.port, protocol = c.protocol }
+          if #json.encode(clean[i]) > ICE.MAX_CANDIDATE_BYTES then
+            return fail(conn, 400, 'bad_candidate',
+                        'candidate ' .. i .. ' exceeds ' .. ICE.MAX_CANDIDATE_BYTES .. ' bytes')
+          end
+        end
+        entry = { ufrag = ufrag, pwd = pwd, candidates = clean, name = cname,
+                  observed = { address = addr, port = port } }
+      end
+    end
     local t = now()
+    entry.at = t
     local ttl = cfg.room_ttl or 300
     local capacity = cfg.room_capacity or 16
-    local list, code, msg = room_join(row.id, room, ttl, capacity,
-      { address = addr, port = port, name = cname, at = t }, t)
+    local list, code, msg = room_join(row.id, room, ttl, capacity, entry, t)
     if not list then
       return fail(conn, code == 'rooms_saturated' and 503 or 409, code, msg)
     end
     traffic_bump(row.id, 'joins')
     local parts = {}
-    for i, c in ipairs(list) do parts[i] = json.encode(c) end
+    for i, c in ipairs(list) do parts[i] = room_entry_json(c) end
     -- CORS for the same reason reflect carries it: a browser on the
     -- room-owner's own page is half the audience for a swarm, and the
     -- door here is the pin or the key in the request, which CORS was
     -- never protecting anyway.
     return reply(conn, 200, '{"room":' .. json.encode(room)
       .. ',"ttl":' .. ttl
-      .. ',"joined":' .. json.encode({ address = addr, port = port, name = cname })
+      .. ',"joined":' .. room_entry_json(entry)
       .. ',"candidates":[' .. table.concat(parts, ',') .. ']}', PUBLIC_READ)
   end
 
@@ -2362,11 +2628,22 @@ local function serve_fetchpoint(conn, req, label, verb)
       end
       local ttl = cfg.room_ttl or 300
       local list = room_list(row.id, room, ttl, now())
-      local parts = {}
-      for i, c in ipairs(list) do parts[i] = json.encode(c) end
+      -- Three numbers, not two, and the honesty is the design (doc/ICE.md
+      -- 6): direct, relay and failed are what peers SAID; silent is a peer
+      -- that joined and never said. Relay bytes the server OBSERVES arrive
+      -- with TURN and are not a room's to count.
+      local parts, oc = {}, { direct = 0, relay = 0, failed = 0, silent = 0 }
+      for i, c in ipairs(list) do
+        parts[i] = room_entry_json(c)
+        if c.ufrag then
+          if c.outcome then oc[c.outcome.path] = oc[c.outcome.path] + 1
+          else oc.silent = oc.silent + 1 end
+        end
+      end
       -- CORS as on the join: the reader is the same browser swarm.
       return reply(conn, 200, '{"service":"rendezvous","label":' .. json.encode(label)
         .. ',"room":' .. json.encode(room) .. ',"ttl":' .. ttl
+        .. ',"outcomes":' .. json.encode(oc)
         .. ',"candidates":[' .. table.concat(parts, ',') .. ']}', PUBLIC_READ)
     end
 
@@ -2648,23 +2925,27 @@ local function fetchpoints_list(req, p)
                         WHERE owner_account_id = ?1 AND deleted_at IS NULL
                           AND (name LIKE ?2 ESCAPE '\' OR label LIKE ?2 ESCAPE '\')]],
                      acct.id, pat).rows[1][1]
-    q = db.query([[SELECT label, name, kind, created_at, updated_at
-                     FROM fetchpoint
-                    WHERE owner_account_id = ?1 AND deleted_at IS NULL
-                      AND (name LIKE ?2 ESCAPE '\' OR label LIKE ?2 ESCAPE '\')
-                    ORDER BY created_at DESC LIMIT 100]],
+    q = db.query([[SELECT f.label, f.name, f.kind, f.config, f.created_at, f.updated_at,
+                          a.address AS adv_address, a.at AS adv_at
+                     FROM fetchpoint f
+                     LEFT JOIN advertisement a ON a.fetchpoint_id = f.id
+                    WHERE f.owner_account_id = ?1 AND f.deleted_at IS NULL
+                      AND (f.name LIKE ?2 ESCAPE '\' OR f.label LIKE ?2 ESCAPE '\')
+                    ORDER BY f.created_at DESC LIMIT 100]],
                  acct.id, pat)
   else
     total = db.query([[SELECT COUNT(*) FROM fetchpoint
                         WHERE owner_account_id = ? AND deleted_at IS NULL]],
                      acct.id).rows[1][1]
-    q = db.query([[SELECT label, name, kind, created_at, updated_at
-                     FROM fetchpoint
-                    WHERE owner_account_id = ? AND deleted_at IS NULL
-                    ORDER BY created_at DESC LIMIT 100]], acct.id)
+    q = db.query([[SELECT f.label, f.name, f.kind, f.config, f.created_at, f.updated_at,
+                          a.address AS adv_address, a.at AS adv_at
+                     FROM fetchpoint f
+                     LEFT JOIN advertisement a ON a.fetchpoint_id = f.id
+                    WHERE f.owner_account_id = ? AND f.deleted_at IS NULL
+                    ORDER BY f.created_at DESC LIMIT 100]], acct.id)
   end
   local out = {}
-  for _, r in ipairs(rows_by_name(q)) do out[#out + 1] = fp_row(r) end
+  for _, r in ipairs(rows_by_name(q)) do out[#out + 1] = fp_row_status(r) end
   -- See reply(): an empty Lua table encodes as `{}`, not `[]`, and a
   -- dashboard for a new account is precisely the case that hits it.
   if #out == 0 then
@@ -3186,7 +3467,9 @@ local function fetchpoints_traffic(req, p)
     since = BOOT_AT,
     counters = { reads = tr.reads or 0, dns_updates = tr.dns_updates or 0,
                  joins = tr.joins or 0, denied = tr.denied or 0,
-                 rate_limited = tr.rate_limited or 0 },
+                 rate_limited = tr.rate_limited or 0,
+                 ice = tr.ice or 0, turn = tr.turn or 0, direct = tr.direct or 0,
+                 relay_reported = tr.relay_reported or 0, failed = tr.failed or 0 },
     storage = 'memory: counters reset when the service restarts',
   }
   if tr.last_at then out.last_request_at = tr.last_at end
@@ -5126,7 +5409,9 @@ local function admin_traffic(req, p)
       deleted = (not fr or fr.deleted_at ~= nil) or nil,
       counters = { reads = r.tr.reads or 0, dns_updates = r.tr.dns_updates or 0,
                    joins = r.tr.joins or 0, denied = r.tr.denied or 0,
-                   rate_limited = r.tr.rate_limited or 0 },
+                   rate_limited = r.tr.rate_limited or 0,
+                   ice = r.tr.ice or 0, turn = r.tr.turn or 0, direct = r.tr.direct or 0,
+                   relay_reported = r.tr.relay_reported or 0, failed = r.tr.failed or 0 },
       last_request_at = r.tr.last_at,
     }
     parts[#parts + 1] = json.encode(row)
