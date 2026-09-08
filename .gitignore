@@ -17,3 +17,8 @@ dollup.json
 dollup.lock
 .dollup/
 data/
+.nogit
+.dump
+.xtr
+x.patch
+x.md
