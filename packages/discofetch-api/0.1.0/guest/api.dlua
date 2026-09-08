@@ -2292,9 +2292,21 @@ local function serve_fetchpoint(conn, req, label, verb)
     -- RTCPeerConnection. Behind the room's door, because the TURN
     -- credential it may carry spends the owner's relay allowance.
     if verb == 'ice' or verb == 'outcome' then
-      if cfg.ice ~= true then
+      -- `ice` needs ice; `outcome` needs only a ROOM. They shared a gate,
+      -- and the cost was that the path we actually ship could not report
+      -- itself: a WireGuard peer punches, joins, hands the room its
+      -- public key, and was then told to PATCH config.ice to say whether
+      -- it went direct -- a verb that hands out TURN credentials against
+      -- the owner's relay allowance, switched on to fix a log line. Both
+      -- ends of the first two-network punch failed here (doc/P2P-
+      -- CAPABILITY.md 5.2i), which is how it was found.
+      if verb == 'ice' and cfg.ice ~= true then
         return fail(conn, 400, 'ice_disabled',
                     'this fetchpoint does not serve ice; PATCH config.ice')
+      end
+      if verb == 'outcome' and not (cfg.rooms == true) then
+        return fail(conn, 400, 'rooms_disabled',
+                    'this fetchpoint does not multiplex rooms; PATCH config.rooms')
       end
       local room = req.query.room or ''
       if room == '' or not valid_room(room) then
@@ -2343,11 +2355,34 @@ local function serve_fetchpoint(conn, req, label, verb)
       -- keyed to a ufrag currently in the room, so a report at least comes
       -- from behind the door. Nothing here tells two members apart.
       local ufrag, path = req.query.ufrag, req.query.path
-      if type(ufrag) ~= 'string' or ufrag == '' then
-        return fail(conn, 400, 'bad_ufrag', 'ufrag is required')
-      end
       if not ICE.PATHS[path] then
         return fail(conn, 400, 'bad_path', 'path is one of direct, relay, failed')
+      end
+      -- Which member is reporting, addressed the way it JOINED: an ICE
+      -- peer by its ufrag, a plain peer by observed address and the port
+      -- it supplied -- the same key room_join built, so no third naming
+      -- scheme appears here. A plain peer cannot know its own observed
+      -- address, and does not have to: this edge already does.
+      local okey, said
+      if ufrag ~= nil and ufrag ~= '' then
+        if type(ufrag) ~= 'string' then
+          return fail(conn, 400, 'bad_ufrag', 'ufrag is a string')
+        end
+        okey, said = 'u#' .. ufrag, { ufrag = ufrag }
+      else
+        local oaddr = observed_address(req)
+        local oport = tonumber(req.query.port or '')
+        if not oaddr then
+          return fail(conn, 400, 'no_observation',
+                      'this request carries no usable address to report for')
+        end
+        if not oport or oport < 1 or oport > 65535 or oport % 1 ~= 0 then
+          return fail(conn, 400, 'bad_port',
+                      'port is the one this peer joined with, so the report '
+                      .. 'can be matched to it (or send ufrag, for an ICE peer)')
+        end
+        okey = oaddr .. '#' .. tostring(oport)
+        said = { address = oaddr, port = oport }
       end
       local rtt
       if req.query.rtt_ms and req.query.rtt_ms ~= '' then
@@ -2357,14 +2392,16 @@ local function serve_fetchpoint(conn, req, label, verb)
         end
       end
       local t = now()
-      local entry = room_get(row.id, room, cfg.room_ttl or 300, 'u#' .. ufrag, t)
+      local entry = room_get(row.id, room, cfg.room_ttl or 300, okey, t)
       if not entry then
-        return fail(conn, 404, 'no_such_peer', 'no peer with that ufrag is in this room')
+        return fail(conn, 404, 'no_such_peer',
+                    'no peer answering to that is in this room')
       end
       entry.outcome = { path = path, rtt_ms = rtt, at = t }
       traffic_bump(row.id, path == 'direct' and 'direct'
                            or path == 'relay' and 'relay_reported' or 'failed')
-      return reply(conn, 200, { ufrag = ufrag, recorded = entry.outcome }, NO_STORE)
+      said.recorded = entry.outcome
+      return reply(conn, 200, said, NO_STORE)
     end
 
     -- The join verb: enter a room as a candidate. The address is observed
@@ -2633,12 +2670,14 @@ local function serve_fetchpoint(conn, req, label, verb)
       -- that joined and never said. Relay bytes the server OBSERVES arrive
       -- with TURN and are not a room's to count.
       local parts, oc = {}, { direct = 0, relay = 0, failed = 0, silent = 0 }
+      -- Every member counts, not only the ICE-shaped ones. Guarding this
+      -- on `c.ufrag` meant the counters answered 0/0/0/0 for a room full
+      -- of WireGuard peers that had all connected -- silence reported as
+      -- absence, for the one path this product ships.
       for i, c in ipairs(list) do
         parts[i] = room_entry_json(c)
-        if c.ufrag then
-          if c.outcome then oc[c.outcome.path] = oc[c.outcome.path] + 1
-          else oc.silent = oc.silent + 1 end
-        end
+        if c.outcome then oc[c.outcome.path] = oc[c.outcome.path] + 1
+        else oc.silent = oc.silent + 1 end
       end
       -- CORS as on the join: the reader is the same browser swarm.
       return reply(conn, 200, '{"service":"rendezvous","label":' .. json.encode(label)
