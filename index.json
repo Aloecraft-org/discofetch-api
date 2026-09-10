@@ -6,9 +6,9 @@
       "versions": {
         "0.1.0": {
           "path": "packages/discofetch-api/0.1.0",
-          "manifest": "sha256:7e02b6208cb596d7f682bb4edffbf5215afc3ff32ae79b1c76e17e3141574d28",
-          "package_id": "sha256:865abc509909f590d1948ae5a027c9cbf2ee06f7705e3660113d74e0ae39d6b2",
-          "code_set": "sha256:da813d15822b495ffec4f85bd656311af82be8b76c8fcb360f6e573fa48a1e69",
+          "manifest": "sha256:d894c4da90899edb557bcc4633f9514c50d9264b11c2f11abd56e0a673008a6e",
+          "package_id": "sha256:d634a20561f0391d269a6582c6d56ad8c1f092f96fce8d9bb036ffd38543cc07",
+          "code_set": "sha256:5d69ed636e2af036d3e22101193b3d5cb9267325d307ce1fed4fcf2bc0400157",
           "faces": [
             "guest"
           ],

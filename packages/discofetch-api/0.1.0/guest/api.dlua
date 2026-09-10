@@ -324,7 +324,52 @@ local MIGRATIONS = {
       [[CREATE INDEX IF NOT EXISTS email_outbox_by_state
           ON email_outbox(state, id)]],
     },
+  },  {
+    version = 9,
+    statements = {
+      -- The four dimensions, promoted out of `config` and out of `kind`
+      -- (doc/FETCHPOINT-DESIGN.md §1). Columns rather than JSON for two
+      -- reasons: STRICT type checking, and because admin_resolve currently
+      -- decodes `config` in Lua to filter on serve == 'dns', which is why its
+      -- pagination counts rows SCANNED rather than returned. As a column that
+      -- filter is an ordinary WHERE.
+      --
+      -- Every column is NULLABLE and nothing is backfilled here. A row written
+      -- before this migration keeps its `kind`, and the read path derives its
+      -- dimensions from it (fp_dimensions, marked transitional). That is
+      -- deliberate: a backfill is a one-time script whose correctness nobody
+      -- can check afterwards, and it would have to run before we know from
+      -- fetch1 which kinds are actually out there. The derive converges as
+      -- rows are rewritten, and it is deleted with the kinds.
+      --
+      -- SOFT, because ADD COLUMN has no IF NOT EXISTS -- see the runner.
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN template TEXT]] },
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN source TEXT]] },
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN access TEXT]] },
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN channel TEXT]] },
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN behavior TEXT]] },
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN subject TEXT]] },
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN published_address TEXT]] },
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN published_locked INTEGER]] },
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN redirect_target TEXT]] },
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN redirect_status INTEGER]] },
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN report_format TEXT]] },
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN serve_relay_config INTEGER]] },
+      -- The hard half. Naming every column in one SELECT makes a soft ALTER
+      -- that failed for the WRONG reason -- a missing table rather than an
+      -- existing column -- raise here instead of being carried silently into
+      -- a deployment where the first symptom is a create that cannot write.
+      [[SELECT template, source, access, channel, behavior, subject,
+               published_address, published_locked, redirect_target,
+               redirect_status, report_format, serve_relay_config
+          FROM fetchpoint LIMIT 0]],
+      -- The resolver's filter is a column now, so it gets the index the JSON
+      -- version could never have.
+      [[CREATE INDEX IF NOT EXISTS fetchpoint_by_channel
+          ON fetchpoint(channel) WHERE deleted_at IS NULL]],
+    },
   },
+
 }
 
 local function migrate()
@@ -339,9 +384,25 @@ local function migrate()
     done[r[1]] = true
   end
 
+  -- A statement is a string that MUST succeed, or { soft = '...' } that may
+  -- fail. Soft exists for exactly one thing: `ALTER TABLE ... ADD COLUMN` has
+  -- no IF NOT EXISTS form, and the version row is written only after every
+  -- statement in a version succeeds -- so a version that stops half way
+  -- re-runs its earlier statements, and a bare ALTER raises `duplicate column
+  -- name` on the second pass. Measured against build11 and drt 0.5.0: ALTER is
+  -- permitted by the authorizer, and it does raise on a re-run.
+  --
+  -- Soft swallows the error, which is the risk: an ALTER that failed because
+  -- the TABLE was missing would be skipped as silently as one that failed
+  -- because the column was already there. So every soft run is followed by a
+  -- HARD statement that names the columns -- a `SELECT ... LIMIT 0` raises
+  -- when a column is absent, which turns "silently skipped" into "loudly
+  -- wrong" at the one moment somebody can still fix it.
   for _, m in ipairs(MIGRATIONS) do
     if not done[m.version] then
-      for _, stmt in ipairs(m.statements) do db.exec(stmt) end
+      for _, stmt in ipairs(m.statements) do
+        if type(stmt) == 'table' then pcall(db.exec, stmt.soft) else db.exec(stmt) end
+      end
       -- The version row goes in only after every statement succeeded. There
       -- are no transactions -- the authorizer denies BEGIN -- so a migration
       -- can stop half applied and there is nothing to roll back. Recording
@@ -351,6 +412,7 @@ local function migrate()
               m.version, now())
     end
   end
+
 end
 
 -- Opening and migrating at startup, but NOT fatally. A crash loop here would
@@ -408,7 +470,19 @@ local ZONE = 'discofetch.link'
 -- deploy-time failure with a compile-time cause, so keep new constants
 -- grouped.
 local ICE = {
-  STUN_URLS = { 'stun:stun1.' .. ZONE .. ':3478', 'stun:stun2.' .. ZONE .. ':3478' },
+  -- The STUN pair, spelled once: RTCPeerConnection wants `stun:` URLs
+  -- (STUN_URLS, below) and `drt netcheck --stun` wants host:port, and two
+  -- lists of the same two servers is how they drift apart.
+  STUN_HOSTS = { 'stun1.' .. ZONE .. ':3478', 'stun2.' .. ZONE .. ':3478' },
+  -- The edges' ADDRESSES, as a caller must reach them to compare two
+  -- vantages: gate1, gate2 (deploy/gates/ns/README.md, NETCHECK-SPEC.md §4).
+  -- Names would not do -- reflect's name resolves to both, and two fetches
+  -- of it can land on one edge twice. Answered in every JSON reflect
+  -- (`measure`, diluvium-drt #25 §1) so `drt netcheck --reflect <url>` is
+  -- the whole invocation: the edge says how to measure against it, and
+  -- the operator stops being the transport for addresses that live in a
+  -- document. When an edge moves, this moves with the zone file.
+  VANTAGES = { '108.165.121.165', '172.237.132.87' },
   TURN_URLS = { 'turn:turn.' .. ZONE .. ':3478?transport=udp' },
   TURN_TTL = 3600,            -- seconds a minted TURN credential lives
   MAX_CANDIDATES = 12,        -- per peer, doc/ICE.md 3
@@ -416,6 +490,7 @@ local ICE = {
   CAND_TYPES = { host = true, srflx = true, prflx = true, relay = true },
   PATHS = { direct = true, relay = true, failed = true },
 }
+ICE.STUN_URLS = { 'stun:' .. ICE.STUN_HOSTS[1], 'stun:' .. ICE.STUN_HOSTS[2] }
 
 -- crypto/random answers in HEX and a guest has no base32, so the regrouping
 -- happens here: 8-bit bytes in, 5-bit symbols out. Ten bytes divides into
@@ -1571,7 +1646,13 @@ local KINDS = {
 -- Refuse unknown config keys BY NAME -- the manner the host treats an
 -- unknown deployment key, and for the same reason: a typo that becomes a
 -- silent default is worse than an error.
-local function validate_config(kind, config)
+-- `dims` is true for a row the new create shape wrote (doc/FETCHPOINT-DESIGN
+-- §1): its config bag is validated against the derived kind's spec, but the
+-- kind's REQUIRED keys are waived, because the one such key (target, for
+-- system:redirect) is a dimension column on that row, and the matrix has
+-- already demanded it. Without the waiver, a redirect shape could never be
+-- created: it derives system:redirect, and system:redirect wants config.target.
+local function validate_config(kind, config, dims)
   if type(config) ~= 'table' then
     return nil, 'config must be a JSON object'
   end
@@ -1608,7 +1689,7 @@ local function validate_config(kind, config)
     end
   end
   for _, f in ipairs(KINDS[kind].config_fields) do
-    if f.required and config[f.key] == nil then
+    if f.required and config[f.key] == nil and not dims then
       return nil, 'config needs ' .. f.key .. ' for ' .. kind
     end
   end
@@ -1626,6 +1707,266 @@ local function validate_config(kind, config)
     end
   end
   return config
+end
+
+-- ------------------------------------------------- the four dimensions
+--
+-- Behaviour is the product of four fields, not a kind string
+-- (doc/FETCHPOINT-DESIGN.md §1). This block is the vocabulary, the validator
+-- that applies the matrix (§4) at config time BY NAME, and two derives that
+-- exist only for the transition and are marked as such.
+local DIM = {}
+DIM.choices = {
+  source        = { 'observed', 'asserted' },
+  access        = { 'anyone', 'token', 'code' },
+  channel       = { 'http', 'dns', 'both' },
+  behavior      = { 'report', 'redirect', 'route' },
+  subject       = { 'caller', 'self' },
+  redirect_kind = { 'status', 'cname' },
+  report_format = { 'json', 'text', 'addr-port' },
+}
+DIM.set = {}
+for k, choices in pairs(DIM.choices) do
+  DIM.set[k] = {}
+  for _, c in ipairs(choices) do DIM.set[k][c] = true end
+end
+DIM.STATUSES = { [301] = true, [302] = true, [307] = true, [308] = true }
+
+-- Every key a dimension-shaped create or PATCH may carry. Anything else is
+-- refused by name -- the manner the host treats an unknown deployment key,
+-- and for the same reason: a typo that becomes a silent default is worse
+-- than an error. `rooms` and `config` are transitional: rooms are not yet an
+-- object of their own, so their settings still ride in config.
+DIM.FIELDS = {
+  name = true, template = true,
+  source = true, access = true, channel = true, behavior = true, subject = true,
+  redirect_kind = true, redirect_target = true, redirect_status = true,
+  report_format = true, published_address = true, published_locked = true,
+  serve_relay_config = true, rooms = true, config = true,
+}
+
+-- Config keys the dimensions REPLACED. Refused by name on a dimension-shaped
+-- body, with the replacement in the sentence, so a client written against
+-- the old shape learns the new one from the refusal rather than from a
+-- silently ignored setting. Read for OLD rows only, in DIM.of.
+DIM.RETIRED = {
+  serve            = 'channel and behavior',
+  address_override = 'published_address with published_locked',
+  format           = 'report_format',
+  ice              = 'serve_relay_config',
+}
+
+-- What the matrix refuses, and why. Returns the dimensions normalised, or
+-- nil plus a code and a sentence. Every refusal here happens at config time
+-- so nothing can be created that the serve path then has to refuse at
+-- runtime by surprise (the discipline doc/ICE.md 4 argued for).
+function DIM.validate(body)
+  local d = {}
+  for k, v in pairs(body) do
+    if not DIM.FIELDS[k] then
+      local repl = DIM.RETIRED[k]
+      return nil, 'unknown_field', repl
+        and (k .. ' was replaced by ' .. repl)
+        or ('no field named ' .. tostring(k))
+    end
+  end
+  for k, choices in pairs(DIM.choices) do
+    local v = body[k]
+    if v ~= nil then
+      if type(v) ~= 'string' or not DIM.set[k][v] then
+        return nil, 'invalid_value', k .. ' must be one of ' .. table.concat(choices, ', ')
+      end
+      d[k] = v
+    end
+  end
+  for _, k in ipairs({ 'access', 'channel', 'behavior' }) do
+    if not d[k] then return nil, 'missing_field', k .. ' is required' end
+  end
+
+  -- report: about whom, and where the address comes from.
+  if d.behavior == 'report' then
+    if not d.subject then
+      return nil, 'missing_field', 'report needs subject: caller (what the caller looks like) or self (where this name points)'
+    end
+    if d.subject == 'caller' then
+      if d.source then return nil, 'not_applicable', 'a report of the caller stores nothing, so source does not apply' end
+      if body.published_address ~= nil or body.published_locked ~= nil then
+        return nil, 'not_applicable', 'a report of the caller has no published address to lock'
+      end
+      if d.channel ~= 'http' then
+        return nil, 'dns_cannot_report_caller', 'the answer differs per caller and a DNS record cannot; use channel: http'
+      end
+    else
+      if not d.source then return nil, 'missing_field', 'report of self needs source: observed or asserted' end
+    end
+  elseif d.subject then
+    return nil, 'not_applicable', 'subject only applies to behavior: report'
+  end
+
+  -- DNS is a rendering, not an interface (§4.1): nothing there can present a
+  -- credential, so a name rendered ONLY to DNS is public or it is refused.
+  if d.channel == 'dns' and d.access ~= 'anyone' then
+    return nil, 'dns_needs_public', 'a DNS record carries no credential; a dns-only name must be access: anyone'
+  end
+  if d.channel == 'dns' and d.behavior == 'route' then
+    return nil, 'dns_cannot_route', 'routing is a data path and DNS only names things; use channel: http'
+  end
+
+  -- redirect: two kinds, told apart by what answers. A status is answered by
+  -- us over HTTP; a CNAME is answered by the resolver and needs no HTTP at
+  -- all -- and a CNAME must be alone at its node, so it cannot share a name
+  -- with the A record the http side would need.
+  if d.behavior == 'redirect' then
+    local rk = d.redirect_kind or (d.channel == 'dns' and 'cname' or 'status')
+    if rk == 'status' and d.channel == 'dns' then
+      return nil, 'status_needs_http', 'nothing answers a 3xx over DNS; a status redirect needs channel: http (or both)'
+    end
+    if rk == 'cname' and d.channel ~= 'dns' then
+      return nil, 'cname_needs_dns', 'a CNAME is answered by the resolver alone; it needs channel: dns'
+    end
+    local target = body.redirect_target
+    if rk == 'cname' then
+      if type(target) ~= 'string' or target == '' then
+        return nil, 'missing_field', 'a cname redirect needs redirect_target: the NAME to point at'
+      end
+      if valid_ip(target) or target:match('^https?://') then
+        return nil, 'cname_needs_a_name', 'CNAME targets are names, not addresses or URLs'
+      end
+      if not target:match('^[a-z0-9][a-z0-9%-]*%.[a-z0-9%-%.]+$') or target:match('%.%.') or target:match('%-%.') then
+        return nil, 'invalid_value', 'redirect_target must be a hostname'
+      end
+    else
+      if target ~= nil then
+        if type(target) ~= 'string' or #target > 2048
+          or not (target:match('^https?://[%w%-%.]+') and not target:match('[%c%s]')) then
+          return nil, 'invalid_value', 'redirect_target must be an http:// or https:// URL'
+        end
+        if d.source then
+          return nil, 'not_applicable', 'a redirect to a fixed target has no reported address; drop source'
+        end
+        if d.channel == 'both' then
+          return nil, 'nothing_to_publish', 'a redirect to a fixed target has no address to publish in DNS; use channel: http'
+        end
+      else
+        -- No target: callers are sent to this name's OWN published address,
+        -- which is the old serve: redirect. It needs somewhere for that
+        -- address to come from.
+        if not d.source then
+          return nil, 'missing_field', 'a redirect with no redirect_target sends callers to this name\'s own address, so it needs source: observed or asserted'
+        end
+      end
+      local st = body.redirect_status
+      if st ~= nil and not DIM.STATUSES[st] then
+        return nil, 'invalid_value', 'redirect_status must be 301, 302, 307 or 308'
+      end
+      d.redirect_status = st
+    end
+    d.redirect_kind, d.redirect_target = rk, target
+  elseif body.redirect_target ~= nil or body.redirect_status ~= nil or d.redirect_kind then
+    return nil, 'not_applicable', 'redirect_* fields only apply to behavior: redirect'
+  end
+
+  if body.report_format ~= nil and not (d.behavior == 'report' and d.subject == 'caller') then
+    return nil, 'not_applicable', 'report_format only applies to a report of the caller'
+  end
+
+  -- The published address and its lock (§1.3). The lock is on the LINK
+  -- between observed and published, never on the write: a locked name keeps
+  -- observing, and the serve path reads both.
+  if body.published_address ~= nil then
+    if type(body.published_address) ~= 'string' or not valid_ip(body.published_address) then
+      return nil, 'invalid_value', 'published_address must be an IPv4 or IPv6 literal'
+    end
+    d.published_address = body.published_address
+  end
+  if body.published_locked ~= nil then
+    if type(body.published_locked) ~= 'boolean' then
+      return nil, 'invalid_value', 'published_locked is true or false'
+    end
+    d.published_locked = body.published_locked
+  end
+  if d.source == 'asserted' and d.published_locked == nil then
+    -- An asserted address is by definition not tracking anything.
+    d.published_locked = true
+  end
+
+  if body.serve_relay_config ~= nil then
+    if type(body.serve_relay_config) ~= 'boolean' then
+      return nil, 'invalid_value', 'serve_relay_config is true or false'
+    end
+    d.serve_relay_config = body.serve_relay_config
+  end
+  if body.template ~= nil and (type(body.template) ~= 'string' or #body.template > 64) then
+    return nil, 'invalid_value', 'template is a string of at most 64 characters'
+  end
+  d.template = body.template
+  return d
+end
+
+-- TRANSITIONAL. The dispatcher below still keys verb gating and the config
+-- registry on `kind`, so a dimension-shaped row is written with the kind
+-- that serves it. This is the reverse of DIM.of and dies with it.
+function DIM.kind_of(d)
+  if d.behavior == 'report' then
+    return d.subject == 'caller' and 'system:reflect' or 'system:rendezvous'
+  elseif d.behavior == 'redirect' then
+    return d.redirect_target and 'system:redirect' or 'system:rendezvous'
+  end
+  return 'wireguard'   -- route: declared, unserved, 501
+end
+
+-- The dimensions of a row, from its columns -- or, TRANSITIONAL, derived
+-- from `kind` plus `config` for a row written before migration 9. The derive
+-- is the ONLY place kind is read for behaviour; it converges as rows are
+-- rewritten and is deleted with the kinds. `serve: dns` maps to `both`,
+-- because it always answered HTTP as well -- DNS was additive, and the old
+-- enum forced a false choice.
+--
+-- Returns the dimensions and the decoded config, since every caller wants
+-- both and decoding twice is how two readers disagree.
+function DIM.of(r)
+  local cfg = r.config
+  if type(cfg) ~= 'table' then
+    local ok, decoded = pcall(json.decode, cfg or '{}')
+    cfg = (ok and type(decoded) == 'table') and decoded or {}
+  end
+  local d = {
+    template = r.template, source = r.source, access = r.access,
+    channel = r.channel, behavior = r.behavior, subject = r.subject,
+    published_address = r.published_address,
+    redirect_target = r.redirect_target, redirect_status = r.redirect_status,
+    report_format = r.report_format,
+  }
+  if r.published_locked ~= nil then d.published_locked = (r.published_locked == 1 or r.published_locked == true) end
+  if r.serve_relay_config ~= nil then d.serve_relay_config = (r.serve_relay_config == 1 or r.serve_relay_config == true) end
+  if d.behavior == nil then
+    local k = r.kind
+    if k == 'system:reflect' then
+      d.behavior, d.subject, d.channel, d.access = 'report', 'caller', 'http', 'anyone'
+      d.report_format = cfg.format
+    elseif k == 'system:rendezvous' then
+      d.subject, d.access = 'self', 'anyone'
+      d.source   = cfg.address_override and 'asserted' or 'observed'
+      d.channel  = cfg.serve == 'dns' and 'both' or 'http'
+      d.behavior = cfg.serve == 'redirect' and 'redirect' or 'report'
+      if cfg.address_override then
+        d.published_address, d.published_locked = cfg.address_override, true
+      else
+        d.published_locked = false
+      end
+      d.serve_relay_config = cfg.ice == true
+    elseif k == 'system:redirect' then
+      d.behavior, d.channel, d.access = 'redirect', 'http', 'anyone'
+      d.redirect_target, d.redirect_status = cfg.target, cfg.status
+    else
+      d.behavior, d.channel, d.access = 'route', 'http', 'anyone'
+    end
+    d.template = d.template or k
+  end
+  if d.behavior == 'redirect' then
+    d.redirect_kind = d.channel == 'dns' and 'cname' or 'status'
+  end
+  return d, cfg
 end
 
 -- ------------------------------------------- config secrets, and the window
@@ -1704,15 +2045,31 @@ local function same_config(a, b)
   return true
 end
 
-local function fp_row(r)
-  return {
+local function fp_row(r, d)
+  d = d or DIM.of(r)
+  local out = {
     label      = r.label,
     fqdn       = r.label .. '.' .. ZONE,
     name       = r.name,
-    kind       = r.kind,
+    kind       = r.kind,       -- TRANSITIONAL: readers move to the dimensions
+    template   = d.template,
+    source     = d.source,
+    access     = d.access,
+    channel    = d.channel,
+    behavior   = d.behavior,
+    subject    = d.subject,
+    redirect_kind   = d.redirect_kind,
+    redirect_target = d.redirect_target,
+    redirect_status = d.redirect_status,
+    report_format   = d.report_format,
+    published_address  = d.published_address,
+    serve_relay_config = d.serve_relay_config,
     created_at = r.created_at,
     updated_at = r.updated_at,
   }
+  -- Only a name with an address of its own has a lock to report.
+  if d.source then out.published_locked = d.published_locked == true end
+  return out
 end
 
 -- The list row's second half: enough to say what a name is FOR and
@@ -2208,6 +2565,7 @@ local function serve_fetchpoint(conn, req, label, verb)
   -- exercised, not who is calling.
   local q = db.query([[SELECT f.id AS id, f.label AS label, f.name AS name,
                               f.kind AS kind, f.config AS config,
+                              f.template AS template, f.source AS source, f.access AS access, f.channel AS channel, f.behavior AS behavior, f.subject AS subject, f.published_address AS published_address, f.published_locked AS published_locked, f.redirect_target AS redirect_target, f.redirect_status AS redirect_status, f.report_format AS report_format, f.serve_relay_config AS serve_relay_config,
                               f.created_at AS created_at, f.updated_at AS updated_at,
                               a.tier AS tier
                          FROM fetchpoint f
@@ -2225,13 +2583,15 @@ local function serve_fetchpoint(conn, req, label, verb)
                 'no fetchpoint answers to ' .. label .. '.' .. ZONE)
   end
   local kind = KINDS[row.kind]
+  -- The dimensions decide the bare-name answer below; `kind` still gates the
+  -- verbs and names the config registry, and both of those move next.
+  local d, cfg = DIM.of(row)
 
   if verb then
     if not (kind and kind.verbs and kind.verbs[verb]) then
       return fail(conn, 404, 'no_verb',
                   row.kind .. ' has no verb ' .. verb)
     end
-    local cfg = json.decode(row.config)
 
     if verb == 'dns' then
       -- The dns verb: advertise-by-showing-up. The address is OBSERVED,
@@ -2283,7 +2643,12 @@ local function serve_fetchpoint(conn, req, label, verb)
       -- never claims a freshness the readers will not see.
       local stored_at, changed = advertise(row.id, addr, t)
       local out = { advertised = { address = addr, at = stored_at }, changed = changed }
-      if cfg.address_override then out.held = 'address_override' end
+      -- held says a lock is pinning the name: the observation was recorded
+      -- and is not what readers get. Two words for one state, for now: the
+      -- old rows' field and the new column.
+      if d.published_locked then
+        out.held = cfg.address_override and 'address_override' or 'published_locked'
+      end
       traffic_bump(row.id, 'dns_updates')
       return reply(conn, 200, out, NO_STORE)
     end
@@ -2588,8 +2953,7 @@ local function serve_fetchpoint(conn, req, label, verb)
   -- someone out there. denied counts the refusals among them.
   traffic_bump(row.id, 'reads')
 
-  if row.kind == 'system:reflect' then
-    local cfg = json.decode(row.config)
+  if d.behavior == 'report' and d.subject == 'caller' then
     local addr = observed_address(req)
 
     -- Text mode: the bare address and a newline, nothing else. This is
@@ -2597,7 +2961,7 @@ local function serve_fetchpoint(conn, req, label, verb)
     -- parsing JSON out of a router's busybox is not a thing to ask of
     -- anyone. ?format= wins over the configured default in both
     -- directions, so one name serves a script and a browser alike.
-    local fmt = req.query.format or cfg.format or 'json'
+    local fmt = req.query.format or d.report_format or 'json'
     if fmt == 'text' then
       -- No observation is an empty line rather than the word 'nil': the
       -- consumer is a variable assignment, and an empty one is testable.
@@ -2622,6 +2986,12 @@ local function serve_fetchpoint(conn, req, label, verb)
       observed = { address = addr, port = prt, edge = req.edge,
                    forwarded = cfg.debug_forwarded and req.forwarded
                      or public_forwarded(req.forwarded) },
+      -- How to measure against this deployment (diluvium-drt #25 §1): the
+      -- STUN pair and the vantage addresses, both as netcheck's own flags
+      -- spell them. Only in the JSON form -- text and addr-port are
+      -- frozen contracts -- and on EVERY name that reports its caller,
+      -- because the measurement is the deployment's, not the canary's.
+      measure = { stun = ICE.STUN_HOSTS, vantages = ICE.VANTAGES },
       request = { method = req.method, path = req.path,
                   query = next(req.query) and req.query or nil },
       host = req.host,
@@ -2632,8 +3002,10 @@ local function serve_fetchpoint(conn, req, label, verb)
     }, PUBLIC_READ)
   end
 
-  if row.kind == 'system:rendezvous' then
-    local cfg = json.decode(row.config)
+  -- A report of self, or a redirect to this name's OWN address (the old
+  -- serve: redirect): both read the published address, both host rooms.
+  if (d.behavior == 'report' and d.subject == 'self')
+     or (d.behavior == 'redirect' and not d.redirect_target) then
 
     -- ?room= reads the candidate list, under the same policy that joins:
     -- a meeting's membership is as private as its door.
@@ -2691,8 +3063,11 @@ local function serve_fetchpoint(conn, req, label, verb)
     -- a reader debugging "why does the name point there" deserves the
     -- answer in the answer.
     local eff, eff_at, eff_src
-    if cfg.address_override then
-      eff, eff_at, eff_src = cfg.address_override, row.updated_at, 'override'
+    if d.published_locked and d.published_address then
+      -- 'override' is what the old rows and their battery say; 'locked' is
+      -- the new word. One state, two spellings, until the kinds go.
+      eff, eff_at, eff_src = d.published_address, row.updated_at,
+                             cfg.address_override and 'override' or 'locked'
     else
       local adv = rows_by_name(db.query(
         'SELECT address, at FROM advertisement WHERE fetchpoint_id = ?', row.id))[1]
@@ -2712,7 +3087,7 @@ local function serve_fetchpoint(conn, req, label, verb)
     -- a hand-set Host -- so it falls through to the JSON answer below.
     -- A redirect would be wrong: once the record lands it points at the
     -- same address the caller already reached.
-    if cfg.serve == 'redirect' and eff then
+    if d.behavior == 'redirect' and eff then
       local hostpart = eff:find(':', 1, true) and ('[' .. eff .. ']') or eff
       local portpart = cfg.serve_port and (':' .. cfg.serve_port) or ''
       local loc = (cfg.serve_scheme or 'http') .. '://' .. hostpart .. portpart
@@ -2731,10 +3106,9 @@ local function serve_fetchpoint(conn, req, label, verb)
       .. json.encode(label) .. ',"advertised":null}', PUBLIC_READ)
   end
 
-  if row.kind == 'system:redirect' then
-    local cfg = json.decode(row.config)
-    return reply(conn, cfg.status or 302, { redirect = cfg.target },
-      { location = cfg.target, ['cache-control'] = 'no-store' })
+  if d.behavior == 'redirect' then
+    return reply(conn, d.redirect_status or 302, { redirect = d.redirect_target },
+      { location = d.redirect_target, ['cache-control'] = 'no-store' })
   end
 
   -- A kind the registry lists and nothing serves. 501 because the address
@@ -2965,6 +3339,7 @@ local function fetchpoints_list(req, p)
                           AND (name LIKE ?2 ESCAPE '\' OR label LIKE ?2 ESCAPE '\')]],
                      acct.id, pat).rows[1][1]
     q = db.query([[SELECT f.label, f.name, f.kind, f.config, f.created_at, f.updated_at,
+                           f.template AS template, f.source AS source, f.access AS access, f.channel AS channel, f.behavior AS behavior, f.subject AS subject, f.published_address AS published_address, f.published_locked AS published_locked, f.redirect_target AS redirect_target, f.redirect_status AS redirect_status, f.report_format AS report_format, f.serve_relay_config AS serve_relay_config,
                           a.address AS adv_address, a.at AS adv_at
                      FROM fetchpoint f
                      LEFT JOIN advertisement a ON a.fetchpoint_id = f.id
@@ -2977,6 +3352,7 @@ local function fetchpoints_list(req, p)
                         WHERE owner_account_id = ? AND deleted_at IS NULL]],
                      acct.id).rows[1][1]
     q = db.query([[SELECT f.label, f.name, f.kind, f.config, f.created_at, f.updated_at,
+                           f.template AS template, f.source AS source, f.access AS access, f.channel AS channel, f.behavior AS behavior, f.subject AS subject, f.published_address AS published_address, f.published_locked AS published_locked, f.redirect_target AS redirect_target, f.redirect_status AS redirect_status, f.report_format AS report_format, f.serve_relay_config AS serve_relay_config,
                           a.address AS adv_address, a.at AS adv_at
                      FROM fetchpoint f
                      LEFT JOIN advertisement a ON a.fetchpoint_id = f.id
@@ -3017,10 +3393,43 @@ local function fetchpoints_create(req, p)
     return 400, { error = { code = 'invalid_name',
                             message = 'name must be a string of 120 characters or fewer' } }
   end
-  local kind = body.kind
-  if type(kind) ~= 'string' or not KINDS[kind] then
-    return 400, { error = { code = 'invalid_kind',
-                            message = 'kind must be one of the registered kinds (GET /v1/kinds)' } }
+  -- TWO CREATE SHAPES, told apart by `kind`. With it, the old shape: the
+  -- panel still sends it, the row is written as rows were before migration
+  -- 9, and the dimensions are derived from kind and config on every read.
+  -- Without it, the new shape (doc/FETCHPOINT-DESIGN.md §1): the body IS
+  -- the dimensions, validated by the matrix, stored as columns, and `kind`
+  -- is derived for the dispatcher that has not moved yet. The old shape is
+  -- transitional and leaves with the kinds.
+  local kind, d = body.kind, nil
+  if kind ~= nil then
+    if type(kind) ~= 'string' or not KINDS[kind] then
+      return 400, { error = { code = 'invalid_kind',
+                              message = 'kind must be one of the registered kinds (GET /v1/kinds)' } }
+    end
+  else
+    local derr, dmsg
+    d, derr, dmsg = DIM.validate(body)
+    if not d then return 400, { error = { code = derr, message = dmsg } } end
+    kind = DIM.kind_of(d)
+    -- A retired key inside `config` is the same mistake as one at the top
+    -- level, and gets the same sentence with the replacement in it.
+    if type(body.config) == 'table' then
+      for k, repl in pairs(DIM.RETIRED) do
+        if body.config[k] ~= nil then
+          return 400, { error = { code = 'unknown_field',
+                                  message = 'config.' .. k .. ' was replaced by ' .. repl } }
+        end
+      end
+    end
+    -- Rooms are not their own object yet, so the switch rides in config
+    -- where the room machinery still reads it.
+    if body.rooms ~= nil then
+      if type(body.rooms) ~= 'boolean' then
+        return 400, { error = { code = 'invalid_value', message = 'rooms is true or false' } }
+      end
+      body.config = body.config or {}
+      body.config.rooms = body.rooms
+    end
   end
   -- The rule fetchpoints_update states, on the other door. A create writes
   -- `config` like a PATCH does, so a window that may not SET an advertise key
@@ -3054,7 +3463,7 @@ local function fetchpoints_create(req, p)
     if not mine then return ms, mpl end
   end
 
-  local config, cerr = validate_config(kind, body.config or {})
+  local config, cerr = validate_config(kind, body.config or {}, d ~= nil)
   if not config then
     return 400, { error = { code = 'invalid_config', message = cerr } }
   end
@@ -3104,17 +3513,53 @@ local function fetchpoints_create(req, p)
     return 503, { error = { code = 'label_unavailable', message = why } }
   end
 
-  -- The derived default: the kind's short name plus the label's first four
-  -- symbols -- 'rendezvous-rjqg' -- which says what it is and which one it
-  -- is, and collides with nothing that matters (names are not unique).
-  if not name then
-    name = (kind:match('([^:]+)$') or kind) .. '-' .. label:sub(1, 4)
+  -- The derived default: what it is plus the label's first four symbols --
+  -- 'report-rjqg' for the new shape, 'collab-draw-rjqg' for the old -- which
+  -- says what it is and which one it is, and collides with nothing that
+  -- matters (names are not unique). The old shape names by kind because its
+  -- panel and its battery look rows up that way (?q=collab-draw).
+  if d == nil then
+    if not name then name = kind .. '-' .. label:sub(1, 4) end
+    -- The old shape writes NO dimension columns: the row is what a row made
+    -- before migration 9 is, and DIM.of derives the dimensions from kind and
+    -- config on every read. Writing the derivation at create time was tried
+    -- and reverted: a config PATCH (serve, address_override) then changed
+    -- what the row DID without changing what the columns SAID, and the serve
+    -- path believed the columns. Legacy rows are backfilled once, when the
+    -- kinds retire (doc/FETCHPOINT-DESIGN.md §8), not one create at a time.
+    if body.template ~= nil and (type(body.template) ~= 'string' or #body.template > 64) then
+      return 400, { error = { code = 'invalid_value',
+                              message = 'template is a string of at most 64 characters' } }
+    end
+    d = { template = body.template }
+  elseif not name then
+    name = d.behavior .. '-' .. label:sub(1, 4)
   end
 
-  local res = db.exec([[INSERT INTO fetchpoint
-      (owner_account_id, label, name, kind, config, created_at, updated_at)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)]],
-      acct.id, label, name, kind, json.encode(config), t)
+  -- The column list is built rather than written, because the connector
+  -- refuses a nil bind ("SQL NULL is spelled NULL in the statement text") and
+  -- most dimension rows leave most dimension columns empty. A boolean lands
+  -- as 1/0, the STRICT table's INTEGER.
+  local cols  = { 'owner_account_id', 'label', 'name', 'kind', 'config', 'created_at', 'updated_at' }
+  local binds = { acct.id, label, name, kind, json.encode(config), t, t }
+  local function put(col, v)
+    if v == nil then return end
+    if type(v) == 'boolean' then v = v and 1 or 0 end
+    cols[#cols + 1] = col; binds[#binds + 1] = v
+  end
+  put('template', d.template);        put('source', d.source)
+  put('access', d.access);            put('channel', d.channel)
+  put('behavior', d.behavior);        put('subject', d.subject)
+  put('published_address', d.published_address)
+  put('published_locked', d.published_locked)
+  put('redirect_target', d.redirect_target)
+  put('redirect_status', d.redirect_status)
+  put('report_format', d.report_format)
+  put('serve_relay_config', d.serve_relay_config)
+  local marks = {}
+  for i = 1, #binds do marks[i] = '?' end
+  local res = db.exec('INSERT INTO fetchpoint (' .. table.concat(cols, ', ')
+    .. ') VALUES (' .. table.concat(marks, ', ') .. ')', table.unpack(binds))
 
   db.exec('UPDATE label SET fetchpoint_id = ? WHERE label = ?',
           res and res.rowid or nil, label)
@@ -3130,7 +3575,7 @@ local function fetchpoints_create(req, p)
   })
 
   local out = fp_row({ label = label, name = name, kind = kind,
-                       created_at = t, updated_at = t })
+                       created_at = t, updated_at = t }, d)
   -- Through config_view for the same reason the read is: a rendezvous point
   -- is BORN holding an advertise key, so the create is the one answer that
   -- hands out a credential nobody asked for -- and inside a window that
@@ -3142,7 +3587,8 @@ end
 local function fetchpoints_get(req, p)
   local acct, status, payload = resolve_account(req)
   if not acct then return status, payload end
-  local q = db.query([[SELECT label, name, kind, config, created_at, updated_at
+  local q = db.query([[SELECT id, label, name, kind, config, created_at, updated_at,
+                              template, source, access, channel, behavior, subject, published_address, published_locked, redirect_target, redirect_status, report_format, serve_relay_config
                          FROM fetchpoint
                         WHERE label = ? AND owner_account_id = ?
                           AND deleted_at IS NULL LIMIT 1]], p.label, acct.id)
@@ -3159,19 +3605,32 @@ local function fetchpoints_get(req, p)
   -- usable. The public read views never touch it. It also carries the
   -- advertisement, because "is my scheduled task working" is the first
   -- question an owner asks this page.
-  local out = fp_row(r)
-  out.config = config_view(req, r.kind, json.decode(r.config))
+  local d, cfg = DIM.of(r)
+  local out = fp_row(r, d)
+  out.config = config_view(req, r.kind, cfg)
   local adv = rows_by_name(db.query(
-    'SELECT address, at FROM advertisement WHERE fetchpoint_id = ?',
-    db.query('SELECT id FROM fetchpoint WHERE label = ? AND deleted_at IS NULL LIMIT 1',
-             p.label).rows[1][1]))[1]
-  if adv then out.advertised = { address = adv.address, at = adv.at } end
+    'SELECT address, at FROM advertisement WHERE fetchpoint_id = ?', r.id))[1]
+  -- `observed` is the new word and `advertised` the old; both for now. The
+  -- observation is reported WHETHER OR NOT the name is locked -- that is the
+  -- lock being on the link and not on the write (§1.3): a pinned name still
+  -- says when its machine was last heard from. json.encode drops a nil, and
+  -- "never observed" is an answer rather than an absence, so the null is
+  -- spelled out the way the public read spells it.
+  if adv then
+    out.advertised = { address = adv.address, at = adv.at }
+    out.observed   = { address = adv.address, at = adv.at }
+    return 200, out
+  end
+  if d.source then
+    return 200, json.encode(out):sub(1, -2) .. ',"observed":null}'
+  end
   return 200, out
 end
 local function fetchpoints_update(req, p)
   local acct, status, payload = resolve_account(req)
   if not acct then return status, payload end
-  local q = db.query([[SELECT id, label, name, kind, config, created_at, updated_at
+  local q = db.query([[SELECT id, label, name, kind, config, created_at, updated_at,
+                              template, source, access, channel, behavior, subject, published_address, published_locked, redirect_target, redirect_status, report_format, serve_relay_config
                          FROM fetchpoint
                         WHERE label = ? AND owner_account_id = ?
                           AND deleted_at IS NULL LIMIT 1]], p.label, acct.id)
@@ -3179,6 +3638,7 @@ local function fetchpoints_update(req, p)
   if not r then
     return 404, { error = { code = 'not_found', message = 'no such fetchpoint' } }
   end
+  local dims = DIM.of(r)
 
   local body = {}
   if req.body and req.body ~= '' then
@@ -3190,12 +3650,17 @@ local function fetchpoints_update(req, p)
     body = decoded
   end
 
-  -- name and config are the whole mutable surface; everything else is
-  -- refused BY NAME. kind is immutable by design (a different kind is a
-  -- different program -- doc/DATA-MODEL.md Â§2), the label by the
-  -- allocator's: a name, once issued, is issued.
+  -- The mutable surface: name, config, and the three §1 fields a name that
+  -- owns an address may change -- template (provenance, and nothing reads
+  -- it, so renaming it breaks nothing), published_address and
+  -- published_locked. Everything else is refused BY NAME. The label is
+  -- immutable by the allocator's rule: a name, once issued, is issued. kind
+  -- is refused as immutable for now because the dispatcher still gates verbs
+  -- on it; the dimensions themselves become PATCHable when it stops.
+  local PATCHABLE = { name = true, config = true, template = true,
+                      published_address = true, published_locked = true }
   for k in pairs(body) do
-    if k ~= 'name' and k ~= 'config' then
+    if not PATCHABLE[k] then
       local why = (k == 'kind' or k == 'label')
         and (k .. ' is immutable after creation')
         or ('no PATCHable field named ' .. tostring(k))
@@ -3274,14 +3739,35 @@ local function fetchpoints_update(req, p)
   local config
   if body.config ~= nil then
     local cerr
-    config, cerr = validate_config(r.kind, body.config)
+    -- r.behavior is set only on rows the new shape wrote (the old shape and
+    -- the pre-migration rows leave it NULL and derive), which is exactly
+    -- the row whose required keys are columns.
+    config, cerr = validate_config(r.kind, body.config, r.behavior ~= nil)
     if not config then
       return 400, { error = { code = 'invalid_config', message = cerr } }
     end
   end
-  if body.name == nil and config == nil then
+  if body.template ~= nil and (type(body.template) ~= 'string' or #body.template > 64) then
+    return 400, { error = { code = 'invalid_value',
+                            message = 'template is a string of at most 64 characters' } }
+  end
+  if (body.published_address ~= nil or body.published_locked ~= nil) and not dims.source then
+    return 400, { error = { code = 'not_applicable',
+                            message = 'this name has no address of its own to publish or lock' } }
+  end
+  if body.published_address ~= nil
+     and (type(body.published_address) ~= 'string' or not valid_ip(body.published_address)) then
+    return 400, { error = { code = 'invalid_value',
+                            message = 'published_address must be an IPv4 or IPv6 literal' } }
+  end
+  if body.published_locked ~= nil and type(body.published_locked) ~= 'boolean' then
+    return 400, { error = { code = 'invalid_value',
+                            message = 'published_locked is true or false' } }
+  end
+  if body.name == nil and config == nil and body.template == nil
+     and body.published_address == nil and body.published_locked == nil then
     return 400, { error = { code = 'nothing_to_change',
-                            message = 'send name and/or config' } }
+                            message = 'send name, config, template, published_address and/or published_locked' } }
   end
 
   local was = json.decode(r.config)
@@ -3315,18 +3801,31 @@ local function fetchpoints_update(req, p)
   -- list means there is nothing to write and nothing to record, so the
   -- UPDATE and the event are both skipped and updated_at stands still --
   -- a timestamp that moves for a no-op is the same lie in a smaller field.
-  local changed = {}
-  if body.name ~= nil and body.name ~= r.name then changed[#changed + 1] = 'name' end
-  if config ~= nil and not same_config(was, config) then changed[#changed + 1] = 'config' end
+  local changed, sets, binds = {}, {}, {}
+  local function moved(field, v)
+    changed[#changed + 1] = field
+    sets[#sets + 1] = field .. ' = ?'
+    binds[#binds + 1] = type(v) == 'boolean' and (v and 1 or 0) or v
+  end
+  if body.name ~= nil and body.name ~= r.name then moved('name', body.name) end
+  if config ~= nil and not same_config(was, config) then moved('config', json.encode(config)) end
+  if body.template ~= nil and body.template ~= dims.template then moved('template', body.template) end
+  if body.published_address ~= nil and body.published_address ~= dims.published_address then
+    moved('published_address', body.published_address)
+  end
+  if body.published_locked ~= nil and body.published_locked ~= dims.published_locked then
+    moved('published_locked', body.published_locked)
+  end
 
   local t = r.updated_at
   if #changed > 0 then
-    -- Concrete values, never nil binds ("SQL NULL is spelled NULL"): the
-    -- unchanged half comes from the row just read, so this stays one
-    -- statement without optional parameters.
+    -- The SET list is built from what moved, for the reason the create's
+    -- column list is: the connector refuses a nil bind, and the fields that
+    -- did not move are simply not in the statement rather than re-bound.
     t = now()
-    db.exec('UPDATE fetchpoint SET name = ?, config = ?, updated_at = ? WHERE id = ?',
-            body.name or r.name, config and json.encode(config) or r.config, t, r.id)
+    binds[#binds + 1] = t; binds[#binds + 1] = r.id
+    db.exec('UPDATE fetchpoint SET ' .. table.concat(sets, ', ')
+      .. ', updated_at = ? WHERE id = ?', table.unpack(binds))
 
     -- WHICH FIELDS, never their values. `config` is where an advertise key
     -- and a room pin live, and a rotation recorded verbatim would leave the
@@ -3337,8 +3836,11 @@ local function fetchpoints_update(req, p)
     })
   end
 
+  if body.template ~= nil then dims.template = body.template end
+  if body.published_address ~= nil then dims.published_address = body.published_address end
+  if body.published_locked ~= nil then dims.published_locked = body.published_locked end
   local out = fp_row({ label = r.label, name = body.name or r.name, kind = r.kind,
-                       created_at = r.created_at, updated_at = t })
+                       created_at = r.created_at, updated_at = t }, dims)
   out.config = config_view(req, r.kind, config or was)
   return 200, out
 end
@@ -4446,7 +4948,7 @@ end
 -- it is safe to hand out precisely BECAUSE it cannot climb -- through here or
 -- anywhere else. Granting admin stays a line in the shell, which is the same
 -- shell the operator already runs for the nameserver's puller account
--- (deploy/ns/CUTOVER.md step 3). Demotion and suspension of an admin are a
+-- (deploy/gates/ns/CUTOVER.md step 3). Demotion and suspension of an admin are a
 -- different question and stay here, guarded.
 --
 -- The role is not the WHOLE gate. Which credential the caller arrived with
@@ -4497,7 +4999,7 @@ local function require_admin(req) return require_role(req, 'admin') end
 -- waitlist landed; this is the half of that sentence the code was missing.
 --
 -- The blanket fix -- require_session on every admin read -- was the wrong
--- one, and expensively so: deploy/ns/df-zone-puller polls
+-- one, and expensively so: deploy/gates/ns/df-zone-puller polls
 -- /v1/admin/resolve every thirty seconds with exactly such a token, and a
 -- session it cannot have would take the nameserver down. The line is not
 -- "which credential" but WHAT IS BEHIND THE ENDPOINT:
@@ -5042,12 +5544,12 @@ local function admin_account_patch(req, p)
       -- with no way to carry it out: ADMIN_NOT_GRANTABLE is the answer on
       -- both doors that could have, and `role` is written nowhere else. So
       -- it names the same shell line that constant does -- the one an
-      -- operator types to make the FIRST admin, per deploy/ns/CUTOVER.md
+      -- operator types to make the FIRST admin, per deploy/gates/ns/CUTOVER.md
       -- step 3 -- because at this point that IS the promotion.
       return 409, { error = { code = 'last_admin',
           message = 'this is the last admin account, and the API does not grant '
             .. 'admin: make another one first with UPDATE account SET role = '
-            .. "'admin' against the database -- the line deploy/ns/CUTOVER.md "
+            .. "'admin' against the database -- the line deploy/gates/ns/CUTOVER.md "
             .. 'step 3 has an operator type -- and then retry this' } }
     end
   end
@@ -5508,7 +6010,7 @@ end
 -- mail server lives on a network the fetch boxes cannot reach -- which is
 -- an arrangement to keep, not to bridge. So this is the zone puller's
 -- shape pointed at a different consumer: rows say what should be sent,
--- df-mail-puller (deploy/mail/) claims them over HTTPS from BESIDE the
+-- df-mail-puller (deploy/mail/puller/) claims them over HTTPS from BESIDE the
 -- relay, renders the template it holds on disk, and reports what the
 -- relay said. Both networks only ever dial out.
 --
@@ -5939,12 +6441,19 @@ local function admin_resolve(req, p)
   local after = (req.query and req.query.after) or ''
   if type(after) ~= 'string' or #after > 63 then after = '' end
 
+  -- Dimension rows publish when their channel says so, and that is a column
+  -- with an index. Rows from before migration 9 have no channel, and keep
+  -- the old JSON filter below until they are rewritten.
   local q = db.query([[SELECT f.label AS label, f.config AS config,
+                              f.channel AS channel,
+                              f.published_address AS published_address,
+                              f.published_locked AS published_locked,
                               a.address AS address, a.at AS at
                          FROM fetchpoint f
                     LEFT JOIN advertisement a ON a.fetchpoint_id = f.id
                         WHERE f.deleted_at IS NULL
-                          AND f.kind = 'system:rendezvous'
+                          AND (f.channel IN ('dns', 'both')
+                               OR (f.channel IS NULL AND f.kind = 'system:rendezvous'))
                           AND f.label > ?1
                      ORDER BY f.label
                         LIMIT ?2]], after, RESOLVE_PAGE)
@@ -5954,12 +6463,15 @@ local function admin_resolve(req, p)
   for _, r in ipairs(rows) do
     last = r.label
     local okc, cfg = pcall(json.decode, r.config)
-    if okc and type(cfg) == 'table' and cfg.serve == 'dns' then
+    if not (okc and type(cfg) == 'table') then cfg = {} end
+    if r.channel ~= nil or cfg.serve == 'dns' then
       -- Same precedence the bare read uses, and it has to stay the same:
       -- a name that answers one address over HTTP and publishes another
       -- in DNS is a bug nobody would think to look for.
       local addr, src = nil, nil
-      if cfg.address_override then
+      if r.published_locked == 1 and r.published_address then
+        addr, src = r.published_address, 'locked'
+      elseif cfg.address_override then
         addr, src = cfg.address_override, 'override'
       elseif r.address then
         addr, src = r.address, 'reported'
@@ -6173,6 +6685,16 @@ end
 
 -- ------------------------------------------------------------------- loop
 
+-- The loop lives in a function, not the main chunk, for a reason that is
+-- not style: Lua caps a function at 200 active locals, the main chunk is
+-- one function, and every `local` above counts against it -- so did the
+-- loop's own block locals while they were in scope here. Wrapping the loop
+-- moves its sixteen into their own function and leaves the chunk room for
+-- the next table someone declares above. If the loader ever says `too many
+-- local variables (limit is 200) in main function`, bundle top-level locals
+-- into a namespace table (as DIM is) rather than moving them out of the
+-- surface block.
+local function serve_forever()
 while true do
   local _, m, why = queue.wait({ http_in }, 30000)
   if why == 'ok' then
@@ -6299,3 +6821,6 @@ while true do
   end
   -- On timeout, loop. This is a daemon: it serves until it is stopped.
 end
+end
+
+serve_forever()
