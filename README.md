@@ -53,18 +53,19 @@ Three files arrive and nothing runs:
 
 ```
 code/discofetch-api/manifest.json
-code/discofetch-api/guest/api.dlua
+code/discofetch-api/guest/api.dlua        the entry
+code/discofetch-api/guest/df/*.dlua       ten modules it requires
 dollup.lock
 ```
 
 Installing never grants. What the program may do lives in your DRT config, and
 writing that config is yours — dollup does not write it and neither does this
-repo. [`reference/discofetch-api.host.lua`](reference/discofetch-api.host.lua) is a
+repo. [`reference/discofetch-api.config.json`](reference/discofetch-api.config.json) is a
 working example to copy and edit; [`reference/README.md`](reference/README.md)
 says which lines a real deployment always changes.
 
 ```sh
-drt run reference/discofetch-api.host.lua     # after editing the scopes
+drt --config reference/discofetch-api.config.json start     # after editing the scopes
 curl -s localhost:8080/health
 ```
 
@@ -76,6 +77,7 @@ curl -s localhost:8080/health
 | version | `0.1.0` |
 | faces | guest only |
 | entry module | `api` → `guest/api.dlua` |
+| modules | eleven, the entry plus `df.*` → `guest/df/*.dlua` |
 | runnable | yes |
 
 The package name is what the program already calls itself: `GET /health`
@@ -85,11 +87,11 @@ running process and the package it was installed from say the same word.
 ```json
 "requires": {
   "capabilities": ["queue:*", "host:sql/*", "host:time", "host:crypto/*"],
-  "diluvium": ">=5.5.1"
+  "diluvium": "2c2f920d7fcfacd72e396e13b8ece5cd11f6d60d"
 }
 ```
 
-Those four names are exactly `api.host.lua`'s `caps` line in discofetch — the
+Those four names are exactly `api.config.json`'s `caps` list in discofetch — the
 ceiling its production deployment serves with, so the one the program is *known* to
 run under.
 
@@ -126,30 +128,61 @@ does not have. The connectors are named in `reference/` instead, where an
 operator needs them anyway, and the field lands the day the shapes are
 versioned.
 
-`diluvium: ">=5.5.1"` understates a real constraint: the program wants
-**5.5.1_build11**, and specifically build10's reply-`headers` support, without
-which the redirect kind cannot send `Location` and every refusal loses its
-`Allow` / `WWW-Authenticate` / `Retry-After`. A build suffix is not semver and
-`requires.diluvium` is a semver range, so the range says what it can and this
-paragraph says the rest.
+`requires.diluvium` is a **git revision**, not a range. It used to be
+`">=5.5.1"` and the current format refuses that by name, for the reason the
+old spelling could never express what this package needs: a build suffix is
+not semver, `5.5.1_build12p1` puts the build in metadata, and precedence
+comparison *ignores* metadata — so `>=5.5.1` could not tell build12 from
+build12p1, which is exactly the distinction anyone asks this field about.
 
-## One module, and why
+The revision above is the core inside **drt v0.6.0rc1** (`5.5.1_build14`,
+which `drt buildinfo` reports as `diluvium: 2c2f920d…`). Two things need it.
+build10's reply-`headers` support, without which the redirect kind cannot send
+`Location` and every refusal loses its `Allow` / `WWW-Authenticate` /
+`Retry-After`. And build14's `DV_FLAG_TEXT_ONLY` reaching the guest's own
+`load`, which is what the module loader below leans on — so a core older than
+this one does not run this package at all, rather than running it with one
+feature missing.
 
-The dollup format has a module map, and this package uses one entry in it.
-That is upstream's constraint, quoted from discofetch's `api/README.md`:
+## Eleven modules, and how that changed
+
+This package carried **one** module until drt v0.6.0rc1, and the reason is
+worth keeping because it explains the shape of everything above. A guest runs
+sealed with no `package` library, so `require` and `dofile` were *nil* — not
+merely unable to find a file — and upstream's `api/README.md` said what
+followed from that:
 
 > Guests have no `require` and no `dofile`, so the server is deliberately one
 > file.
 
-Splitting the program into `label.dlua`, `rooms.dlua`, `admin.dlua` and the
-rest is the obvious next move and it is **not available yet**: a guest runs
-sealed with no `package` library, so `require` and `dofile` are *nil* — not
-merely unable to find a file. The pre-registered module set that would make
-`require` resolvable is Phase 1 of an ask still open against DRT. Until that
-lands, a multi-module package here would be a package that does not run.
+That file reached 6,826 lines, against Lua's ceiling of 200 locals per
+function, which is the pressure that made the ask worth filing.
 
-`grep require` on the module finds 75 hits and **zero** real calls: they are
-identifiers — `require_session`, `require_role`, `admin_required`. Worth
+**It landed.** rc1 resolves modules at load: the host reads every `.dlua` and
+`.lua` beside the entry, compiles each with the `load` the seal deliberately
+keeps, and installs a `require` over the result. No new hostcall, capability,
+format or ABI — and each module spends its own 200 locals rather than the
+entry's, which is the relief it was wanted for.
+
+So the face is an entry plus ten modules now, and three properties of that are
+this package's business:
+
+- **They travel together or not at all.** An entry without its modules is a
+  node whose first `require` has nothing to answer it. `guest.modules` names
+  every one, `seal` hashes every one, and a consumer that copies only the
+  entry has built a broken release — which is why discofetch's own staging
+  reads this map rather than a filename.
+- **A module's name is its path.** `df.model` is `guest/df/model.dlua` and
+  nowhere else; the two are one fact seen from two sides, and `sync-from-discofetch.sh`
+  writes the map from the files so they cannot drift.
+- **A stray file in the face is not ignored.** Every `.lua` and `.dlua` under
+  a node's directory is a module, and one whose name is not
+  `[A-Za-z0-9_]` between the dots refuses the *whole node* — after the
+  listener has bound, which reads as the service being up and the API being
+  down.
+
+`grep require` on the entry now finds real calls *and* the identifiers it
+always had — `require_session`, `require_role`, `admin_required`. Worth
 knowing before one of them is read as a module load.
 
 The same constraint has a second half worth knowing, because it explains why
@@ -160,9 +193,11 @@ FetchPoint guests.
 
 ## Provenance
 
-`packages/discofetch-api/0.1.0/guest/api.dlua` is `sha256` identical to
-discofetch's `api/supervisor.lua` at the commit it was taken from. The only
-change is the filename, because the dollup format's guest face uses `.dlua`.
+Every file under `packages/discofetch-api/0.1.0/guest/` is `sha256` identical
+to one under discofetch's `api/` at the commit it was taken from:
+`guest/api.dlua` to `api/supervisor.lua`, and each `guest/df/*.dlua` to the
+`api/df/*.dlua` of the same name. The only change is the entry's filename,
+because the dollup format's guest face uses `.dlua`.
 
 Byte-identity is worth keeping. It turns "has this fork drifted?" into a
 `cmp`, and it stops this repo becoming a second, divergent implementation of
@@ -242,7 +277,7 @@ signature travels with the tree, so signing once covers all four transports.
 ## Changing the package
 
 ```sh
-$EDITOR packages/discofetch-api/0.1.0/guest/api.dlua   # (but see Provenance)
+./sync-from-discofetch.sh --update                     # the whole set, from upstream
 dollup repo seal packages/discofetch-api/0.1.0                # rehash, rewrite `files`
 dollup repo index .                                       # re-index, independently
 ```
@@ -254,8 +289,14 @@ consumer's requirement picks one.
 
 ## Verified
 
-On **both runtimes**, from the package as dollup delivers it — resolved into a
-deployment, then started from `code/` with `reference/discofetch-api.host.lua`:
+From the package as dollup delivers it — resolved into a deployment, then
+started from `code/` with `reference/discofetch-api.config.json`.
+
+**Read the dates.** Everything below was measured on the ONE-MODULE package,
+before the split, and the C host is no longer a runtime this package has: it
+reads neither the JSON config nor a module. The module set is verified
+upstream — discofetch's battery, 873 checks, against the drt v0.6.0rc1 release
+— and a re-run of the list below through `dollup add` is owed.
 
 - **DRT 0.1.0** (`drt --config … start`), which is what discofetch runs in
   production — binary
@@ -266,6 +307,7 @@ Identical results on both:
 
 - `dollup add discofetch-api` → materialized; `dollup verify` → clean
 - the delivered module is `sha256` identical to upstream `api/supervisor.lua`
+  (one file, then; the whole face, now — see Provenance)
 - it starts, migrations apply, `GET /health` → `200 {"db":"ready"}`
 - refusals are real: `404 no_route`, `401 unauthenticated`
 - `GET /v1/me` → the account's quota and tier; `GET /v1/kinds` → the registry

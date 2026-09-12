@@ -1,0 +1,117 @@
+-- df/event_log -- the one writer for the program's event table.
+--
+-- Extracted from supervisor.lua at B0, unchanged except that shared state
+-- (db, db_ready, now, json) is reached through the context this module is
+-- given rather than through main-chunk upvalues, which a module cannot see.
+--
+-- ====================================================== the surface block
+--
+-- Entry points:   M.init(ctx)  once, before anything logs
+--                 M.log_event(kind, subject_id, actor, fields)
+--                 M.trim_events()
+--
+-- The context: a table the caller keeps and fills. Its fields are read at
+-- CALL time, not at init, because `db` is not open when this module loads --
+-- it arrives when migrate() succeeds, which is after every require runs.
+--   ctx.db        the sql handle            ctx.now   -> unix SECONDS
+--   ctx.db_ready  false until migrate wins  ctx.json  the codec
+--
+-- Configurable: EVENT_RETENTION, EVENT_TRIM_EVERY, below.
+--
+-- ====================================================== end of the surface
+
+local M = {}
+local C
+
+function M.init(ctx)
+  assert(type(ctx) == 'table', 'event_log.init: a context table, read at call time')
+  C = ctx
+end
+
+-- --------------------------------------------------------- the event log
+--
+-- One writer for the whole program, so "is this action recorded" is a
+-- question with one place to look rather than a grep. Three properties, in
+-- the order they matter.
+--
+-- It NEVER THROWS AND NEVER FAILS A REQUEST. An event describes something
+-- that already happened -- every call site runs after the durable write it
+-- reports has succeeded -- so a broken log costs the log and never the
+-- customer's create. Hence the pcall around the body, the early return when
+-- the database is shut, and the print rather than a raised error: losing an
+-- event quietly is bad, losing the FetchPoint someone just made is worse.
+--
+-- NO SECRETS IN `detail`. Not a token secret, not an advertise key, not a
+-- room pin. These rows are read back by the customer over GET /v1/events and
+-- by anyone holding an audit account, so a secret written here is a secret
+-- handed to two audiences it was never meant for. Record which field changed,
+-- not what a credential changed to.
+--
+-- Optional columns are ABSENT FROM THE STATEMENT rather than bound as nil:
+-- the connector refuses a nil bind outright ("SQL NULL is spelled NULL in the
+-- statement text"), so fetchpoint_id, label and address join the column list
+-- only when there is a value, and the placeholders are built to match.
+--
+-- `actor` is the account that acted, or nil for the ordinary case where the
+-- subject acted on their own account -- which is what makes the self/staff
+-- distinction in the timeline mean something.
+local EVENT_RETENTION  = 90 * 24 * 3600   -- 90 days, in seconds
+local EVENT_TRIM_EVERY = 200              -- inserts between opportunistic trims
+local events_written = 0
+
+function M.trim_events()
+  C.db.exec('DELETE FROM event WHERE at < ?', C.now() - EVENT_RETENTION)
+end
+
+function M.log_event(kind, subject_id, actor, f)
+  if not C.db_ready then return end
+  local ok, err = pcall(function()
+    f = f or {}
+    -- WHO WAS REALLY AT THE KEYBOARD. Every handler passes the account it
+    -- resolved, which under impersonation IS THE CUSTOMER -- so taking that
+    -- row at face value would write `actor_id = account_id` and the timeline
+    -- would tell the customer they did it themselves. The real caller rides
+    -- on the row act_as_apply hands back (`acted_by`), and it is unwrapped
+    -- HERE, in the one writer, rather than at ten call sites and whichever
+    -- ones a later slice adds: the property this function advertises is that
+    -- there is one place to look, and an audit trail that depends on every
+    -- caller remembering something is not an audit trail.
+    local who = actor and (actor.acted_by or actor) or nil
+    local cols  = { 'at', 'kind', 'account_id', 'actor_id', 'actor_role', 'detail' }
+    local binds = { C.now(), kind, subject_id,
+                    who and who.id or subject_id,
+                    who and who.role or 'user',
+                    C.json.encode(f.detail or {}) }
+    for _, name in ipairs({ 'fetchpoint_id', 'label', 'address' }) do
+      local v = f[name]
+      if v ~= nil and v ~= '' then
+        cols[#cols + 1]   = name
+        binds[#binds + 1] = v
+      end
+    end
+    local marks = {}
+    for i = 1, #binds do marks[i] = '?' .. i end
+    C.db.exec('INSERT INTO event (' .. table.concat(cols, ', ')
+              .. ') VALUES (' .. table.concat(marks, ', ') .. ')',
+            table.unpack(binds))
+
+    -- Opportunistic retention, because there is no cron inside the guest:
+    -- no timers, no second process, nothing that will ever come along and
+    -- prune this table. An event log that only grows is a slow outage on a
+    -- database that does not yet have backups. Trimming on one insert in
+    -- two hundred bills the cost to the writer causing the growth, keeps it
+    -- off the other hundred and ninety-nine, and needs no scheduler to be
+    -- correct -- only to be eventual, which retention is.
+    --
+    -- The counter is PROCESS-LOCAL, though, so this branch alone never fires
+    -- on a service restarted more often than it writes two hundred events.
+    -- Hence the second trim, at startup, below.
+    events_written = events_written + 1
+    if events_written % EVENT_TRIM_EVERY == 0 then M.trim_events() end
+  end)
+  if not ok then
+    print('log_event ' .. tostring(kind) .. ': ' .. tostring(err))
+  end
+end
+
+return M

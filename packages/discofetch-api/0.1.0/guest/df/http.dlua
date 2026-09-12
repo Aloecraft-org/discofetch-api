@@ -1,0 +1,173 @@
+-- df/http -- the wire: request parsing, the one response envelope, and the
+-- edge's observation of the caller.
+--
+-- Extracted from supervisor.lua at B0, behaviour unchanged.
+--
+-- ====================================================== the surface block
+--
+-- Entry points:   M.init(ctx)
+--                 M.split_query(target)   path and query, decoded
+--                 M.reply(conn, status, payload, headers, content_type)
+--                 M.fail(conn, status, code, message, headers)
+--                 M.observed_address(req)   M.observed_port(req)
+--                 M.public_forwarded(chain)
+--                 M.AUTH_CHALLENGE
+--
+-- Two facts here exist only as comments and are the reason this is a module
+-- rather than five helpers: json.encode CANNOT express an empty ARRAY, so a
+-- string payload passes through verbatim; and a header name absent from the
+-- deployment's response_headers allowlist is dropped WHOLE and silently.
+--
+-- public_forwarded is the leak filter. It classifies the mapped tail of a
+-- v4-mapped v6 as well as the head, because a dual-stack proxy writing
+-- ::ffff:10.0.0.1 walked a private address straight through it until that
+-- landed.
+--
+-- The context: ctx.json, ctx.push, ctx.http_out. Read at call time.
+--
+-- ====================================================== end of the surface
+
+local M = {}
+local C
+
+function M.init(ctx)
+  assert(type(ctx) == 'table', 'http.init: a context table, read at call time')
+  C = ctx
+end
+
+-- ---------------------------------------------------------------- helpers
+
+-- The listener hands over the request target verbatim, query string and all
+-- -- it does not interpret paths, which is the right layering and means the
+-- split happens here.
+local function split_query(target)
+  local path, qs = target:match('^([^?]*)%??(.*)$')
+  local query = {}
+  if qs and qs ~= '' then
+    for pair in qs:gmatch('[^&]+') do
+      local k, v = pair:match('^([^=]*)=?(.*)$')
+      if k and k ~= '' then
+        -- percent-decoding, enough for the shapes we care about (`q=a%20b`)
+        v = v:gsub('+', ' '):gsub('%%(%x%x)', function(h)
+          return string.char(tonumber(h, 16))
+        end)
+        query[k] = v
+      end
+    end
+  end
+  return path, query
+end
+
+-- One envelope for every answer, so a client never has to branch on shape.
+-- A string payload is passed through verbatim. That exists for exactly one
+-- reason: C.json.encode cannot express an empty ARRAY. djson.c decides a
+-- table's shape from its keys and an empty table has none, so it emits `{}` --
+-- and there is no C.json.as_array to say otherwise (msgpack has one, json does
+-- not). A client that checks `.length` on `{}` breaks, so the empty list is
+-- spelled out as text rather than guessed at.
+-- `headers` (build10) may carry only names the deployment's
+-- response_headers allowlist grants -- an off-list name is dropped whole
+-- by the host, silently, so a header that matters must be on that list in
+-- both host files or it quietly never leaves.
+local function reply(conn, status, payload, headers, content_type)
+  C.push(C.http_out, {
+    conn = conn,
+    status = status,
+    body = type(payload) == 'string' and payload or C.json.encode(payload),
+    -- JSON unless a caller says otherwise, and exactly one does: reflect's
+    -- text mode, which exists to be piped into a shell variable. The
+    -- listener owns this header, so it is a field rather than a name on
+    -- the response_headers allowlist (which refuses content-type by name).
+    content_type = content_type or 'application/json',
+    headers = headers,
+  })
+end
+
+local AUTH_CHALLENGE = { ['www-authenticate'] = 'Bearer realm="discofetch"' }
+
+local function fail(conn, status, code, message, headers)
+  reply(conn, status, { error = { code = code, message = message } }, headers)
+end
+
+-- The edge's observation of the caller. x-real-ip first: the edge SETS it
+-- from the connection it terminated, so it has exactly one writer we own.
+-- The x-forwarded-for FIRST element is the fallback for paths without
+-- that edge (local runs, the api_in path) -- informational there, because
+-- an appended chain can be seeded by the caller. The dns verb, where the
+-- answer becomes durable state, accepts only the set header or a
+-- single-element chain, never a seeded one.
+local function observed_address(req)
+  if req.real_ip and req.real_ip ~= '' then return req.real_ip end
+  return req.forwarded and req.forwarded:match('^%s*([^,%s]+)') or nil
+end
+
+-- The PORT the edge observed the caller from. x-real-port ONLY, and no
+-- x-forwarded-for-style fallback: no such convention exists for ports,
+-- and a guessed port is worse than none -- the consumer is a NAT
+-- diagnostic comparing mappings, and a wrong number there is a wrong
+-- conclusion. Same one-writer construction as x-real-ip: the edge sets it
+-- from the connection it terminated.
+local function observed_port(req)
+  local p = tonumber(req.real_port or '')
+  if p and p >= 1 and p <= 65535 and p % 1 == 0 then return p end
+  return nil
+end
+
+-- The public half of the relay chain. The raw x-forwarded-for names
+-- every hop, and the inner ones map the deployment's own topology -- its
+-- private legs and gateway addresses -- for anyone curious; a production
+-- deployment echoed an internal address to the world until this.
+-- Private, CGNAT, loopback and link-local
+-- entries are dropped from the public echo, and an empty result is nil
+-- rather than an empty string. The raw chain stays available to the
+-- owner via cfg.debug_forwarded, where debugging the path is the point.
+local function public_forwarded(chain)
+  if type(chain) ~= 'string' then return nil end
+  local kept = {}
+  for entry in chain:gmatch('[^,]+') do
+    local e = entry:match('^%s*(.-)%s*$')
+    if e ~= '' then
+      -- What to CLASSIFY, which is not always what we echo. A v4-mapped v6
+      -- address carries its v4 address in the TAIL -- `::ffff:10.0.0.1`, plus
+      -- the expanded `0:0:0:0:0:ffff:10.0.0.1` and upper-case spellings --
+      -- where the octet test below cannot see it, so a dual-stack proxy
+      -- writing that form walked a private address straight through this
+      -- filter. That is the exact leak this function exists to stop, wearing
+      -- a different spelling. Brackets come off for the same reason, and a
+      -- non-greedy match so `[::1]:8080` loses its port too.
+      --
+      -- What gets KEPT is still `e`, the original spelling: we decide on the
+      -- address, we echo what actually arrived.
+      local bare   = e:match('^%[(.-)%]') or e
+      local mapped = bare:match('^[0:]*:[fF][fF][fF][fF]:(%d+%.%d+%.%d+%.%d+)$')
+                  or bare:match('^::(%d+%.%d+%.%d+%.%d+)$')
+      local test   = mapped or bare
+      local a, b = test:match('^(%d+)%.(%d+)%.')
+      a, b = tonumber(a), tonumber(b)
+      local internal =
+           (a == 10) or (a == 127)
+        or (a == 192 and b == 168)
+        or (a == 172 and b ~= nil and b >= 16 and b <= 31)
+        or (a == 100 and b ~= nil and b >= 64 and b <= 127)
+        or (a == 169 and b == 254)
+      if not internal then
+        local low = test:lower()
+        internal = low == '::1' or low:match('^f[cd]') ~= nil
+          or low:match('^fe[89ab]') ~= nil
+      end
+      if not internal then kept[#kept + 1] = e end
+    end
+  end
+  if #kept == 0 then return nil end
+  return table.concat(kept, ', ')
+end
+
+M.split_query       = split_query
+M.reply             = reply
+M.fail              = fail
+M.AUTH_CHALLENGE    = AUTH_CHALLENGE
+M.observed_address  = observed_address
+M.observed_port     = observed_port
+M.public_forwarded  = public_forwarded
+
+return M

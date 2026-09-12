@@ -4,7 +4,17 @@
   "guest": {
     "main": "api",
     "modules": {
-      "api": "guest/api.dlua"
+      "api": "guest/api.dlua",
+      "df.api": "guest/df/api.dlua",
+      "df.event_log": "guest/df/event_log.dlua",
+      "df.fetchpoint": "guest/df/fetchpoint.dlua",
+      "df.grants": "guest/df/grants.dlua",
+      "df.http": "guest/df/http.dlua",
+      "df.identity": "guest/df/identity.dlua",
+      "df.label": "guest/df/label.dlua",
+      "df.meter": "guest/df/meter.dlua",
+      "df.model": "guest/df/model.dlua",
+      "df.rooms": "guest/df/rooms.dlua"
     },
     "source_only": true
   },
@@ -15,9 +25,19 @@
       "host:time",
       "host:crypto/*"
     ],
-    "diluvium": ">=5.5.1"
+    "diluvium": "2c2f920d7fcfacd72e396e13b8ece5cd11f6d60d"
   },
   "files": {
-    "guest/api.dlua": "sha256:28ebd46e3fcfb52d170586b2ccab499ca383d19acf957c16772105fa0d674004"
+    "guest/api.dlua": "sha256:6b9ec527b4b74ff5ba8585c034f421684de898a5d0f8096a77ece24eb7a55482",
+    "guest/df/api.dlua": "sha256:6a39aa0c6275bf146558a8f77ea35f0ef9a35f775d1e13c5c3ef1372666016f4",
+    "guest/df/event_log.dlua": "sha256:cd572d0abec68e6e95f3027daf49a8772fe09a5ac1fc222884a27a3ed59f4b0e",
+    "guest/df/fetchpoint.dlua": "sha256:057851c36e348ae590361f0314f57b8f06ab13e50cd24e963f13084fdfcb2a88",
+    "guest/df/grants.dlua": "sha256:f2be431dc6458e969282b61325a586ed1d47bdaa8cd1ce0423eb140944a92fd4",
+    "guest/df/http.dlua": "sha256:b9eb908c5c9c3b25d58b3a29023d71a69e31bae70f198e3d56abd70cee209bdd",
+    "guest/df/identity.dlua": "sha256:cb2903875069dce46ccb052c4e716b742ad1c3eb745a0b33f2742db567f7bad1",
+    "guest/df/label.dlua": "sha256:d538153d280f06950036fd39b243a07f56586e6f87686e8b0b39bd94110fafc7",
+    "guest/df/meter.dlua": "sha256:8ed6788f69264ef2533673c9efd9166b8d64803f6d608ea8df92cce7fd590339",
+    "guest/df/model.dlua": "sha256:9d3086293d1d9a0dcfc3b974af475555f7ff0dfd544429e3412b0b56ee34cca1",
+    "guest/df/rooms.dlua": "sha256:802a4ff5e7d70df123416d60486f8cd0847aada5d7af3060dfcefae6778862ae"
   }
 }

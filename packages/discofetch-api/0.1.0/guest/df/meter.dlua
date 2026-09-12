@@ -1,0 +1,198 @@
+-- df/meter -- quotas, rate limits and traffic counters.
+--
+-- Extracted from supervisor.lua at B0. The body is unchanged apart from the
+-- injected clock; what a tier may hold, how fast a name may be exercised and
+-- what actually happened are one subject and stay one file.
+--
+-- ====================================================== the surface block
+--
+-- Entry points:   M.init(ctx)            once, before anything meters
+--                 M.tier_of(name)        the row a tier names, free on a typo
+--                 M.rate_allow(key, per_hour, burst)
+--                 M.rate_headers(wait)   what every 429 carries
+--                 M.traffic_bump(fp_id, field)
+--                 M.traffic_totals()     the whole meter added up
+--                 M.shed_count()         how often the bucket table was shed
+--
+-- Read directly by the admin surface, and exported rather than copied where
+-- the value moves: M.TIERS and M.TRAFFIC are the live tables, M.BUCKETS_MAX
+-- and M.BOOT_AT are constants after init, and the shed COUNTER is a function
+-- because a copy taken at startup would report zero forever.
+--
+-- Configurable: TIERS (the published plans are the other half of this
+-- decision -- see www/plans.html), BUCKETS_MAX, EVENT-free by design.
+--
+-- The context: ctx.now -> unix SECONDS. Nothing here touches sql, and the
+-- root never hibernates; those two invariants are why this is memory.
+--
+-- ====================================================== end of the surface
+
+local M = {}
+local C
+
+-- ------------------------------------------------------------- the meter
+--
+-- Quotas, rate limits and traffic counters, together because they are one
+-- subject: what a tier may hold, how fast a name may be exercised, and
+-- what actually happened. TIERS is the registry the numbers live in --
+-- account.tier names a row here, and an unknown tier gets free's numbers
+-- rather than an error, because a typo'd tier must degrade, never outage.
+--
+-- The buckets and the counters are MEMORY, deliberately -- the same tier
+-- as the rooms store, holding the same two invariants (root never
+-- hibernates; nothing here touches the sql connector). A rate window that
+-- survives a deploy is not worth a database write per request, and a
+-- counter that resets on restart says so in its answer.
+
+-- The published plans (www/plans.html) and this table are one decision in
+-- two places; the numbers HERE are the ones that bite. What is priced but
+-- not yet metered -- relay gigabytes -- deliberately has no field: a limit
+-- the code cannot enforce does not belong in an answer that reads as
+-- enforcement. It ships with the relay.
+-- `invites` is the advocacy dial doc/INVITES-AND-GRANTS.md names: how many
+-- LIVE codes an account may hold open at once -- not revoked, not expired,
+-- uses remaining. Free gets a couple because an invite is the reason someone
+-- passes one on; paid gets more because advocacy is what the tier is buying.
+local TIERS = {
+  free    = { title = 'Free',    fetchpoints = 3,
+              tokens = 1,        invites = 2,
+              dns_per_hour = 120,   dns_burst = 10,
+              joins_per_min = 120,  joins_burst = 60 },
+  homelab = { title = 'Homelab', fetchpoints = 25,
+              tokens = 10,       invites = 10,
+              dns_per_hour = 720,   dns_burst = 30,
+              joins_per_min = 600,  joins_burst = 300 },
+  -- "Unlimited" as the page says it, bounded here as the number no honest
+  -- account reaches: an actual absence of a cap is how one bug fills a
+  -- disk. Raising it for a real customer is an UPDATE, not a deploy.
+  platform = { title = 'Platform', fetchpoints = 2000,
+              tokens = 100,      invites = 50,
+              dns_per_hour = 7200,  dns_burst = 120,
+              joins_per_min = 6000, joins_burst = 1200 },
+  -- The bootstrap account. Large numbers rather than an exemption,
+  -- because nothing should run unmetered -- including us.
+  system  = { title = 'System',  fetchpoints = 1000,
+              tokens = 20,       invites = 50,
+              dns_per_hour = 3600,  dns_burst = 120,
+              joins_per_min = 6000, joins_burst = 1200 },
+}
+-- 'plus' was the second tier before the plans had names. Any row still
+-- carrying it means Homelab; an alias costs one line and a rename that
+-- silently demotes a paying account costs rather more.
+TIERS.plus = TIERS.homelab
+local function tier_of(name) return TIERS[name] or TIERS.free end
+
+-- One token bucket per key, refilled continuously, spent one request at a
+-- time. per_hour is the sustained rate; burst is the bucket, and it is
+-- what a scheduled task waking from sleep and firing its queued updates
+-- actually needs. Returns true, or false plus whole seconds until a token
+-- exists -- the retry-after value, computed rather than guessed.
+local BUCKETS = {}
+local BUCKETS_MAX = 100000       -- a memory backstop, far above honest use
+local buckets_count = 0
+-- How often the table above has been dropped whole. A shed is INVISIBLE from
+-- inside a request -- everyone simply gets a fresh burst -- and from outside
+-- it looks like the rate limiter briefly not being there, which is the one
+-- symptom nobody would think to attribute to a memory cap. One integer, read
+-- back by GET /v1/admin/stats, is the difference between that being a
+-- question with an answer and a question nobody can ask. It is the closest
+-- thing to monitoring this program has until LAUNCH_LIST item 13 lands.
+local buckets_shed = 0
+
+local function rate_allow(key, per_hour, burst)
+  local t = C.now()
+  local b = BUCKETS[key]
+  if not b then
+    if buckets_count >= BUCKETS_MAX then
+      -- Shed the whole table rather than refuse new keys: the cost is one
+      -- fresh burst for everyone, the alternative is stale keys squatting
+      -- while new callers are turned away.
+      BUCKETS = {}
+      buckets_count = 0
+      buckets_shed = buckets_shed + 1
+    end
+    b = { tokens = burst, at = t }
+    BUCKETS[key] = b
+    buckets_count = buckets_count + 1
+  end
+  local rate = per_hour / 3600
+  b.tokens = math.min(burst, b.tokens + (t - b.at) * rate)
+  b.at = t
+  if b.tokens >= 1 then
+    b.tokens = b.tokens - 1
+    return true
+  end
+  return false, math.max(1, math.ceil((1 - b.tokens) / rate))
+end
+
+-- Headers every 429 carries: when to come back, and never from a cache.
+local function rate_headers(wait)
+  return { ['retry-after'] = tostring(wait), ['cache-control'] = 'no-store' }
+end
+
+-- What actually happened, per fetchpoint, since the last restart. reads
+-- counts bare-name requests whatever their outcome; dns_updates and joins
+-- count what LANDED; denied and rate_limited count the refusals among
+-- them. The window is honest rather than impressive: these answer "is my
+-- scheduled task running" and "is someone poking at my door", not billing.
+local BOOT_AT            -- set by init(): the context is not there at load
+local TRAFFIC = {}
+
+local function traffic_bump(fp_id, field)
+  local tr = TRAFFIC[fp_id]
+  if not tr then
+    tr = { reads = 0, dns_updates = 0, joins = 0,
+           denied = 0, rate_limited = 0,
+           -- ICE: credentials handed out, and what peers REPORTED. Nothing
+           -- here is observed; the room read says silent for the rest.
+           ice = 0, turn = 0, direct = 0, relay_reported = 0, failed = 0 }
+    TRAFFIC[fp_id] = tr
+  end
+  tr[field] = tr[field] + 1
+  tr.last_at = C.now()
+end
+
+-- The whole meter added up, plus how many ids it holds. Two readers now --
+-- the operator's traffic page and the stats card -- and one definition,
+-- because two copies of "what the totals are" drift and the copy that drifts
+-- is the one somebody is reading numbers off out loud. `names` counts what
+-- has been TOUCHED since boot rather than what exists: a fetchpoint arrives
+-- in this table on its first request and a name nobody has called is not in
+-- it, which is the honest answer to "what is being hit".
+local function traffic_totals()
+  local totals = { reads = 0, dns_updates = 0, joins = 0,
+                   denied = 0, rate_limited = 0,
+                   ice = 0, turn = 0, direct = 0, relay_reported = 0, failed = 0 }
+  local names = 0
+  for _, tr in pairs(TRAFFIC) do
+    names = names + 1
+    for k in pairs(totals) do totals[k] = totals[k] + (tr[k] or 0) end
+  end
+  return totals, names
+end
+
+function M.init(ctx)
+  assert(type(ctx) == 'table' and type(ctx.now) == 'function',
+         'meter.init: ctx.now must answer unix SECONDS')
+  C = ctx
+  -- Boot is when the meter starts counting, which is init rather than load:
+  -- the clock arrives with the context. Both happen at startup.
+  BOOT_AT = C.now()
+  M.BOOT_AT = BOOT_AT
+end
+
+-- The two COUNTERS are functions and the tables are references, deliberately:
+-- see the surface block.
+function M.shed_count()   return buckets_shed end
+function M.bucket_count() return buckets_count end
+
+M.TIERS          = TIERS
+M.TRAFFIC        = TRAFFIC
+M.BUCKETS_MAX    = BUCKETS_MAX
+M.tier_of        = tier_of
+M.rate_allow     = rate_allow
+M.rate_headers   = rate_headers
+M.traffic_bump   = traffic_bump
+M.traffic_totals = traffic_totals
+
+return M

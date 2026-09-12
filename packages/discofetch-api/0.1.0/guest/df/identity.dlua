@@ -1,0 +1,481 @@
+-- df/identity -- who is asking: tokens, sessions, and acting as somebody else.
+--
+-- Extracted from supervisor.lua at B0, behaviour unchanged.
+--
+-- ====================================================== the surface block
+--
+-- Entry points:   M.init(ctx)
+--                 M.resolve_account(req)     the 34-call-site one
+--                 M.require_session(req, why)  M.require_own_account(req, why)
+--                 M.act_as_apply(...)        M.opaque_token(authorization)
+--                 M.waitlist_join(req, p)
+--                 M.TOKEN_PREFIX  M.TOKEN_BYTES
+--
+-- The trust model, which is the reason this is one module rather than
+-- helpers scattered near their callers:
+--
+--   x-df-sub is the gateway's ASSERTION. HAProxy strips every inbound
+--   x-df- header BY PREFIX (`del-header x-df- -m beg`) and re-adds this one
+--   only after verifying the JWT. That strip is the entire reason it can be
+--   trusted, and it is enforced at the frontend, not here.
+--
+--   act-as is the client's REQUEST. It sits deliberately OUTSIDE the x-df-
+--   namespace so that nothing about the name suggests it was checked. It is
+--   honoured only when the account x-df-sub names holds role admin, and
+--   IGNORED -- not refused -- for everyone else.
+--
+-- The context: ctx.db, ctx.now, ctx.json, ctx.host. Read at call time.
+--
+-- ====================================================== end of the surface
+
+local M = {}
+local C
+local MT = require('df.meter')
+local EV = require('df.event_log')
+
+function M.init(ctx)
+  assert(type(ctx) == 'table', 'identity.init: a context table, read at call time')
+  C = ctx
+end
+
+--
+-- ------------------------------------------------------------------ tokens
+--
+-- A token is `dfp_live_` followed by 32 base32 characters -- 160 bits out of
+-- crypto/random, the same source and the same alphabet as a label. The prefix
+-- is part of the secret string rather than decoration: it is what lets the
+-- GATEWAY tell an opaque token from a JWT without parsing either (haproxy.cfg,
+-- is_opaque_token), and what lets a leaked credential be recognised in a log
+-- or a repository scan as belonging to this system.
+local TOKEN_PREFIX = 'dfp_live_'
+local TOKEN_BYTES = 20
+
+-- Pulled out of the Authorization header, and deliberately strict: only a
+-- Bearer whose value starts with the prefix and contains nothing but the
+-- alphabet is treated as a token. Anything else -- a JWT that reached us
+-- because the gateway is misconfigured, a truncated paste -- is not a token
+-- and must not be hashed and looked up as though it might be.
+local function opaque_token(authorization)
+  if type(authorization) ~= 'string' then return nil end
+  local v = authorization:match('^[Bb]earer%s+(.+)$')
+  if not v then return nil end
+  local body = v:match('^' .. TOKEN_PREFIX .. '([a-z2-7]+)$')
+  if not body then return nil end
+  return TOKEN_PREFIX .. body
+end
+
+-- The account a token belongs to, or nil plus the refusal.
+--
+-- Every failure answers the SAME 401 with the same sentence: revoked, expired,
+-- never existed, belongs to a deleted account. Distinguishing them would tell
+-- someone holding a stolen token which of those it is, and there is no case
+-- where the holder needs to know and the panel cannot say better.
+local function account_by_token(secret)
+  local deny = { error = { code = 'unauthenticated',
+                           message = 'that token is not valid' } }
+  local t = C.now()
+  local q = C.db.query([[SELECT a.id, a.auth0_sub, a.email, a.tier, a.role,
+                              a.created_at, a.last_seen_at, k.id, k.last_used_at
+                         FROM api_token k
+                         JOIN account a ON a.id = k.account_id
+                        WHERE k.hash = ?1
+                          AND k.revoked_at IS NULL
+                          AND (k.expires_at IS NULL OR k.expires_at > ?2)
+                          AND a.suspended_at IS NULL
+                        LIMIT 1]], C.host.crypto.hash(secret), t)
+  local row = q.rows[1]
+  if not row then return nil, 401, deny end
+
+  -- Coarse, for the same reason last_seen_at is: this is a read path, and
+  -- turning every authenticated request into a write costs more than
+  -- five-minute resolution is worth. The panel shows "last used" to help
+  -- someone decide whether a token is still in use, which is a question
+  -- nobody asks to the minute.
+  local token_id, last_used = row[8], row[9]
+  if last_used == nil or last_used < t - 300 then
+    C.db.exec('UPDATE api_token SET last_used_at = ? WHERE id = ?', t, token_id)
+  end
+
+  return { id = row[1], auth0_sub = row[2], email = row[3], tier = row[4],
+           role = row[5], created_at = row[6], last_seen_at = row[7] }
+end
+
+-- Minting and revoking require a SESSION, never a token.
+--
+-- A token that can mint tokens cannot be revoked in any meaningful sense:
+-- whoever holds it makes another one the moment the first is cut off, and the
+-- list in the panel stops being the truth about who has access. The same
+-- argument covers revocation -- a stolen token must not be able to lock the
+-- owner out by revoking theirs.
+--
+-- This is the one place below the middleware that knows how the caller
+-- arrived, and it is deliberate rather than a leak of the abstraction: the
+-- distinction being made is precisely "which credential", so it cannot be
+-- made anywhere else.
+--
+-- `why` is the sentence, because the rule being enforced is not always this
+-- one: the admin reads use this same check for a different reason (see
+-- require_person), and a refusal that explains the wrong rule sends the
+-- reader to debug something that was never in their way.
+local function require_session(req, why)
+  if req.via == 'session' then return true end
+  return false, 403, { error = { code = 'session_required',
+                                 message = why or
+                                   'tokens cannot mint or revoke tokens; sign in to manage them' } }
+end
+
+-- The other half of that question, and it arrived with impersonation: not
+-- WHICH CREDENTIAL but WHOSE FACE. An admin acting as a customer (act_as_apply,
+-- below) may do everything the customer can, because reproducing a bug means
+-- being able to create the thing that breaks -- with two exceptions, and both
+-- are held back for the same property rather than for squeamishness: they
+-- OUTLIVE the window. Everything else impersonation touches is undone by
+-- undoing it; a credential minted or revoked in there is not.
+--
+-- `why` is the sentence for the same reason require_session takes one: there
+-- are two rules behind this code and a refusal that explains the other one
+-- sends the reader to debug something that was never in their way.
+local function require_own_account(req, why)
+  if not req.impersonating then return true end
+  return false, 403, { error = { code = 'act_as_forbidden', message = why } }
+end
+
+-- Assigned further down, beside the event log, because impersonation WRITES
+-- an event and a Lua local must precede its use. The definition lives there;
+-- the two calls live here, in resolve_account, which is the only place in the
+-- program that knows who the real caller is. See "acting as somebody else".
+local act_as_apply
+
+-- Returns the account row, or nil plus a status and a payload to answer with.
+local function resolve_account(req)
+  if not C.db_ready then
+    return nil, 503, { error = { code = 'db_unavailable',
+                                 message = db_error or 'the database is not open' } }
+  end
+
+  -- A token is the OTHER way in, and it resolves to the same account row that
+  -- a session does. Nothing below this function learns which was used, except
+  -- the two places that must: minting and revoking (see require_session).
+  --
+  -- Checked before x-df-sub only because a request carries one or the other;
+  -- the gateway strips x-df-* from anything it did not verify itself, and it
+  -- passes dfp_live_ bearers through without parsing them as JWTs.
+  local secret = opaque_token(req.authorization)
+  if secret then
+    local row, status, payload = account_by_token(secret)
+    if not row then return nil, status, payload end
+    req.via = 'token'
+    -- Through act_as_apply on this path too, and it exists here to REFUSE: a
+    -- token carrying act-as is told no rather than quietly served as its own
+    -- owner. Ignoring the header would leave a caller who believes they are
+    -- acting as a customer in fact acting as an ADMIN, which is the most
+    -- dangerous of the three possible outcomes.
+    return act_as_apply(req, row)
+  end
+
+  if not req.sub then
+    -- The gateway asserts x-df-sub only after verifying a token, so its
+    -- absence means "not authenticated" rather than "bad request" -- and no
+    -- account row is created for a caller nobody vouched for.
+    return nil, 401, { error = { code = 'unauthenticated',
+                                 message = 'no verified identity on this request' } }
+  end
+  req.via = 'session'
+
+  local t = C.now()
+
+  -- Registration is CLOSED. This is the lock, and it is here rather than in
+  -- Auth0 or the panel because this is the only place that can hold it: the
+  -- tenant will mint a valid token for any Google account, the gateway will
+  -- verify it honestly (that is its job), and hiding a button changes what
+  -- is convenient, not what is possible. A verified identity with no account
+  -- row is a stranger with real ID -- authenticated, and not a customer.
+  --
+  -- When registration opens, this becomes the upsert it used to be (it is in
+  -- the git history at this line) plus whatever invitation or quota logic
+  -- opening actually means. Until then, accounts are created by the operator:
+  --
+  --   sqlite3 /var/lib/discofetch/discofetch.sqlite \
+  --     "INSERT INTO account (auth0_sub, created_at) VALUES ('<sub>', strftime('%s','now'))"
+  --
+  -- ?1/?2 rather than plain ? because the connector insists you "bind them
+  -- all or none". last_seen_at is written coarsely, per doc/DATA-MODEL.md §4:
+  -- updating it on every request turns every read into a write, and the
+  -- panel does not need better than five-minute resolution.
+  C.db.exec([[UPDATE account SET last_seen_at = ?2
+             WHERE auth0_sub = ?1
+               AND (last_seen_at IS NULL OR last_seen_at < ?2 - 300)]],
+          req.sub, t)
+
+  -- suspended_at is READ here rather than filtered on, and that is the split
+  -- this file already argues for elsewhere: which credential arrived changes
+  -- what a refusal may say. A SESSION is a verified human, so "your account is
+  -- suspended" is a true sentence we can afford to say, and it is far cheaper
+  -- than the support ticket that 'registration is closed; this identity has no
+  -- account' generates when a customer of six months reads it about their own
+  -- account. account_by_token keeps the opposite rule for the opposite reason,
+  -- and the comment there says why: a stolen token learns nothing.
+  --
+  -- auth0_sub rides along because impersonation's answer names both identities
+  -- (me_get), and because it is the only name an account with no email has.
+  local q = C.db.query([[SELECT id, auth0_sub, email, tier, role, created_at,
+                              last_seen_at, suspended_at
+                         FROM account WHERE auth0_sub = ? LIMIT 1]], req.sub)
+  local row = q.rows[1]
+  if not row then
+    -- 403, not 401: the credential is fine and the answer is still no.
+    -- Refusing to say which -- a generic 401 -- would send a real customer
+    -- whose row was somehow lost into re-login loops instead of support.
+    return nil, 403, { error = { code = 'registration_closed',
+                                 message = 'registration is closed; this identity has no account' } }
+  end
+
+  -- Map by column name. Positional indexing works right up until someone
+  -- reorders the SELECT, and then it silently swaps two fields of the same
+  -- type -- here, two timestamps.
+  local acct = {}
+  for i, name in ipairs(q.cols) do acct[name] = row[i] end
+
+  -- Suspension closes the CONTROL PLANE -- the panel, the API, this row --
+  -- and nothing else. A suspended account's FetchPoints keep serving, on
+  -- purpose: a billing dispute that silently takes down somebody's home
+  -- network is an incident rather than a collection strategy, and serve_
+  -- fetchpoint deliberately never looks at the owner's account. Abuse needs
+  -- a different hammer (a per-fetchpoint disable), and it is not built here.
+  if acct.suspended_at ~= nil then
+    return nil, 403, { error = { code = 'account_suspended',
+                                 message = 'this account is suspended; your names keep serving, and support can lift it' } }
+  end
+
+  return act_as_apply(req, acct)
+end
+
+-- The waitlist: the only handler in this file that serves a stranger, on
+-- purpose (see PUBLIC). Registration is closed; this is the door knocker.
+local function waitlist_join(req, p)
+  if not C.db_ready then
+    return 503, { error = { code = 'db_unavailable',
+                            message = db_error or 'the database is not open' } }
+  end
+
+  -- Shed abuse before parsing it, twice over. The GLOBAL bucket first: on
+  -- the api path x-real-ip is only as trustworthy as the fronting proxy
+  -- makes it, so a rotated header must never mean
+  -- unlimited rows -- this cap bounds the table's growth absolutely, at a
+  -- rate far above honest signups. Then per address: keyed by the edge's
+  -- observation when one arrived, sized for a conference wifi where many
+  -- people share one address; callers with no observation share one
+  -- generous bucket -- the local dev path and any edge that forgets the
+  -- header land there.
+  local okg, waitg = MT.rate_allow('waitlist:global', 200, 50)
+  if not okg then
+    return 429, { error = { code = 'rate_limited',
+                            message = 'the waitlist is being hammered; retry in '
+                              .. waitg .. 's' } },
+           MT.rate_headers(waitg)
+  end
+  -- x-real-ip ONLY, never the x-forwarded-for fallback: a limiter keyed
+  -- on a header the caller can seed is a limiter the caller configures.
+  -- observed_address's fallback is right for reflect (informational) and
+  -- wrong here, where the key IS the enforcement.
+  local who = (req.real_ip and req.real_ip ~= '') and req.real_ip or nil
+  local okr, wait = MT.rate_allow(who and ('waitlist:' .. who) or 'waitlist:unknown',
+                               who and 12 or 60, who and 5 or 30)
+  if not okr then
+    return 429, { error = { code = 'rate_limited',
+                            message = 'too many signups from this address; retry in '
+                              .. wait .. 's' } },
+           MT.rate_headers(wait)
+  end
+
+  local body = {}
+  if req.body and req.body ~= '' then
+    local ok, decoded = pcall(C.json.decode, req.body)
+    if not ok or type(decoded) ~= 'table' then
+      return 400, { error = { code = 'malformed_body',
+                              message = 'the body is not a JSON object' } }
+    end
+    body = decoded
+  end
+
+  -- `website` is a honeypot input on the form: absent from what a person
+  -- sees, filled by bots that fill everything. Answer success and write
+  -- nothing -- a refusal would teach the bot which field gave it away.
+  if type(body.website) == 'string' and body.website ~= '' then
+    return 200, { ok = true, message = 'you are on the list' }
+  end
+
+  local email = body.email
+  if type(email) ~= 'string' then email = '' end
+  email = email:match('^%s*(.-)%s*$'):lower()
+
+  -- The shape check is deliberately loose: something@something, sane length.
+  -- Real validation of an email is delivering to it, which is a later
+  -- problem; refusing plausible addresses on regex grounds costs signups and
+  -- protects nothing. 254 is RFC 5321's ceiling.
+  if #email < 3 or #email > 254 or not email:match('^[^@%s]+@[^@%s]+%.[^@%s]+$') then
+    return 400, { error = { code = 'invalid_email',
+                            message = 'that does not look like an email address' } }
+  end
+
+  -- OR IGNORE against the UNIQUE: a duplicate is a success, not an error,
+  -- and the two are indistinguishable from outside ON PURPOSE. Answering
+  -- "already signed up" to an unauthenticated caller would make this a
+  -- membership oracle for any address someone cares to probe.
+  C.db.exec([[INSERT OR IGNORE INTO waitlist (email, created_at, source)
+            VALUES (?, ?, 'front-page')]], email, C.now())
+
+  return 200, { ok = true,
+                message = 'you are on the list' }
+end
+
+-- A query's rows as name->value maps rather than as positional arrays. Up
+-- here rather than beside its first heavy user because the grants below need
+
+-- --------------------------------------------------- acting as somebody else
+--
+-- `act-as` has sat on the listener's header allowlist since the gateway
+-- landed, promising this and honouring none of it. This is the promise kept:
+-- an admin puts an account id in the header and the request runs AS that
+-- account -- same tier, same quota, same rows, same refusals -- because
+-- reproducing a customer's problem means being able to create the thing that
+-- breaks, and "can you click that for me?" is how support teaches people to
+-- hand over their credentials.
+--
+-- It resolves in exactly ONE place: here, called from the end of
+-- resolve_account, after the real caller is known. Every handler below that
+-- line reads `acct` and sees a customer; nothing else in this program has to
+-- remember the feature exists. That is the property being bought, and it is
+-- why the header is consulted nowhere else.
+--
+-- The refusals, in the order they are checked. Each one closes a specific way
+-- this stops being a support tool and becomes a privilege escalation:
+--
+--   * a TOKEN may never impersonate. A token is a long-lived bearer secret
+--     that can be copied out of an env file, a CI job or a shell history; a
+--     session is a human who authenticated a moment ago. Impersonation is
+--     precisely the capability that should cost a fresh authentication.
+--   * only an ADMIN may. `audit` is the read-only role, and impersonation is
+--     a write capability wearing a read's clothes -- it would hand the role
+--     we invented to show people the MECHANISM a way into the contents.
+--   * never on /v1/admin. An admin acting as a customer while using admin
+--     routes raises a question -- which identity did that mutation run
+--     under? -- that is much cheaper to refuse than to answer later.
+--   * never AS an admin. Otherwise an admin about to be demoted launders
+--     themselves through a colleague's account and acts from in there, and
+--     every guard in admin_account_patch is worth nothing. It also makes
+--     acting as YOURSELF impossible, which is a happy consequence.
+--   * never as a SUSPENDED account. Suspension is this system refusing an
+--     identity; a staff window into it would be the one door left open.
+--   * never as a SYSTEM account. It owns the reflect canary and no IdP can
+--     mint its sub, which is the invariant the bootstrap states; act-as is
+--     the only way into an account nobody can log in to, and a deleted
+--     canary cannot be re-created because labels are never re-issued.
+--
+-- doc/DATA-MODEL.md describes this header as carrying the target's auth0_sub
+-- and as being IGNORED for callers who may not use it. Both are older than
+-- this code and neither survived contact with it: the id is what every
+-- endpoint in the admin section addresses an account by, and a silent ignore
+-- leaves a caller who believes they are acting as a customer acting as
+-- themselves -- which, for an admin, is the failure this whole slice exists
+-- to prevent. The refusals above are honest 403s like every other one here.
+local ACT_AS_EVENT_EVERY = 300     -- seconds between impersonate.start rows
+
+function act_as_apply(req, caller)
+  local want = req.act_as
+  -- The ordinary path, and it must stay indistinguishable from a program
+  -- that never heard of any of this.
+  if want == nil or want == '' then return caller end
+
+  if req.via ~= 'session' then
+    return nil, 403, { error = { code = 'act_as_session_required',
+      message = 'act-as needs a signed-in session; a token may not act as anybody' } }
+  end
+  if caller.role ~= 'admin' then
+    return nil, 403, { error = { code = 'admin_required',
+      message = 'act-as requires an admin account' } }
+  end
+  -- The whole subtree, matched without the trailing slash so that a bare
+  -- /v1/admin route added later is covered by the rule rather than by
+  -- whoever remembers to come back here.
+  if (req.path or ''):match('^/v1/admin') then
+    return nil, 403, { error = { code = 'act_as_not_here',
+      message = 'admin routes are not available while acting as somebody else; drop the act-as header' } }
+  end
+
+  -- An integer id or nothing. A header is a string from outside, a bind
+  -- takes the value it is handed, and a float is not an id -- so anything
+  -- that is not a whole positive number names no account and lands on the
+  -- same honest 404 as an id that never existed.
+  local id = tonumber(want)
+  local target
+  if id and id == math.floor(id) and id >= 1 then
+    target = C.rows_by_name(C.db.query(
+      [[SELECT id, auth0_sub, email, tier, role, created_at, last_seen_at,
+               suspended_at
+          FROM account WHERE id = ? LIMIT 1]], id))[1]
+  end
+  if not target then
+    return nil, 404, { error = { code = 'no_such_account',
+      message = 'act-as names no account; it takes the id from GET /v1/admin/accounts' } }
+  end
+  -- Never the SYSTEM account, and this is the one refusal that is not about
+  -- a person at all. The bootstrap creates 'system|root' to own reflect --
+  -- the permanent end-to-end canary -- and its comment states the invariant
+  -- it rests on: no IdP can mint that sub, so nothing can log in as the
+  -- owner. act-as is the way into an account that never asks an IdP, and it
+  -- reaches DELETE /v1/fetchpoints/reflect; labels are never re-issued, so
+  -- the idempotent bootstrap cannot put the canary back and the loss is
+  -- permanent. Matched on the SCOPE PREFIX -- everything up to the bar, the
+  -- half AUDIT_MASK calls mechanism -- rather than on the bootstrap's id, so
+  -- a second system account is covered by the rule the day it exists rather
+  -- than by whoever remembers to come back here.
+  if (target.auth0_sub or ''):match('^([^|]*)|') == 'system' then
+    return nil, 403, { error = { code = 'no_impersonating_system',
+      message = 'that is a system account, not a customer; it owns the reflect canary, no identity provider can sign in as it, and act-as is not the exception' } }
+  end
+  if target.suspended_at ~= nil then
+    return nil, 403, { error = { code = 'account_suspended',
+      message = 'that account is suspended; you cannot act as an identity the system itself refuses' } }
+  end
+  if target.role == 'admin' then
+    return nil, 403, { error = { code = 'no_impersonating_admins',
+      message = 'admins cannot act as other admins' } }
+  end
+
+  -- ONE ROW PER WINDOW, not one per request. The panel makes a handful of
+  -- calls per page, and the write amplification the event log refuses for dns
+  -- updates it must refuse here too: what is worth recording is that staff
+  -- looked, not how many XHRs the page happened to make. Five minutes is the
+  -- window; the cost is one indexed single-row SELECT on a path that runs
+  -- when somebody is working a support ticket, which is rare and slow anyway.
+  local recent = C.db.query([[SELECT at FROM event
+                             WHERE kind = 'impersonate.start'
+                               AND account_id = ?1 AND actor_id = ?2
+                             ORDER BY id DESC LIMIT 1]], target.id, caller.id).rows[1]
+  if not recent or recent[1] < C.now() - ACT_AS_EVENT_EVERY then
+    EV.log_event('impersonate.start', target.id, caller, { address = req.real_ip })
+  end
+
+  -- The real caller is recorded TWICE, and the duplication is the point:
+  -- neither reader can see the other's copy. The guards and me_get are handed
+  -- the REQUEST and read it there; log_event is handed an account ROW by ten
+  -- call sites that know nothing about any of this, and reads `acted_by` off
+  -- it. Everything else below keeps reading `acct` and correctly sees a
+  -- customer, which is the whole point of resolving this here.
+  req.actor = caller
+  req.impersonating = true
+  target.acted_by = caller
+  return target
+end
+
+M.TOKEN_PREFIX       = TOKEN_PREFIX
+M.TOKEN_BYTES        = TOKEN_BYTES
+M.opaque_token       = opaque_token
+M.require_session    = require_session
+M.require_own_account = require_own_account
+M.act_as_apply       = act_as_apply
+M.resolve_account    = resolve_account
+M.waitlist_join      = waitlist_join
+
+return M

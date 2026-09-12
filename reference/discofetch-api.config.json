@@ -1,0 +1,56 @@
+{
+  "_this": "discofetch API -- a REFERENCE deployment for the dollup-delivered package. An EXAMPLE, not the deployment: copy it, change the scopes, and keep your copy. dollup never writes a DRT config and this repo does not either -- what a program may do lives in your config, not in the package, so the file that grants is the one file dollup must not own. Converted from discofetch-api.host.lua when DRT v0.6.0rc1 dropped the .host.lua dialect; the reasoning that lived in Lua comments lives in the underscore keys here. Serde ignores them at every depth -- but NEVER inside a connector's `scope`, which is passed to the connector verbatim, and never inside a map whose keys are data.",
+
+  "_program": "Names what dollup materialized. A deployment's code root defaults to `code/`, and a package lands under its own name, so the entry this repo ships arrives at exactly the path below. If you set `code_root` to something else in dollup.json, change this line to match. A relative path resolves against THIS FILE's directory since rc1, not the working directory.",
+  "program": { "path": "code/discofetch-api/guest/api.dlua" },
+
+  "_modules": "There is nothing to name here. The face's other ten files -- `code/discofetch-api/guest/df/*.dlua` -- are modules, and drt resolves every `.dlua` and `.lua` beside the entry before the program runs. Two consequences worth knowing. They must travel WITH the entry: an entry alone is a node whose first `require` has nothing to answer it. And a stray `.lua` in that directory is a module too -- one whose name is not `[A-Za-z0-9_]` between the dots refuses the whole node, after the listener has bound.",
+
+  "_scopes": "The sql scope and the crypto key_file are the two lines a real deployment always edits. `data/` is relative to the host's cwd, which is fine for a local run and wrong for a service; a service uses an absolute path that systemd's StateDirectory= creates. A config runs with an empty environment -- a config declares, it does not compute -- so there is no variable to switch on: two deployments are two files.",
+
+  "_first_start": "The database must exist WITH WAL before the first start, because `create: false` below refuses to conjure one:\n\n  python3 -c \"import sqlite3;c=sqlite3.connect('data/discofetch.sqlite');c.execute('PRAGMA journal_mode=WAL');c.close()\"\n  head -c 32 /dev/urandom > data/crypto.key && chmod 600 data/crypto.key",
+
+  "_caps": "sql and time both have a consumer: the migration runner and /v1/me. `time` is easy to forget and is not part of sql -- created_at is NOT NULL, and wall time in a guest is a hostcall like any other.",
+  "caps": [
+    { "capability": "queue:*" },
+    { "capability": "host:sql/*" },
+    { "capability": "host:time" },
+    { "capability": "host:crypto/*" }
+  ],
+
+  "_crypto": "Needed for crypto/random, which draws the 80 bits behind every label. The connector refuses to open without a signing key of at least 16 bytes even though random never uses one, so this is a startup dependency and not a lazy one: no key, no deployment. The host reads the file, derives two subkeys and forgets the master. The guest never sees any of it -- it calls crypto/* and the key stays outside its heap and outside its snapshot, which is the point of the connector holding it rather than the program.",
+
+  "_sql": "scope is relative to the host's cwd. create: false is what makes a typo'd name say `no database named 'discofecth.sqlite' in this deployment's scope, and creating one is not granted` instead of leaving a silently-empty second file that looks exactly like data loss -- and it is not paranoia: a database the connector creates comes up journal_mode=delete (measured, 5.5.1_build9), which Litestream cannot replicate and nothing can retrofit in place. max_result_rows REFUSES past the cap rather than truncating, so every list query carries LIMIT and anything wide is aggregated in SQL; 256 is roomy for the per-account reads this API makes and small enough that a missing LIMIT fails loudly in development rather than in a year.",
+
+  "connectors": {
+    "time": {},
+    "crypto": { "scope": { "key_file": "data/crypto.key" } },
+    "sql": { "scope": {
+      "scope": "data",
+      "access": "readwrite",
+      "create": false,
+      "max_result_rows": 256
+    } }
+  },
+
+  "_listeners": "A listener is top-level, not a connector: the host owns the socket and the guest reads a queue. The port is host topology, never a guest's choice -- the program does not know what port it is on and cannot bind one. Headers are lowercase and an allowlist: a header the deployment does not name never reaches the program, which cannot then learn it existed. They are not equally trustworthy, which is most of why they are worth naming one at a time. authorization: the caller's credential, reported as present/absent and never by value. x-df-sub: the gateway's ASSERTION -- the edge strips every inbound x-df- header and re-adds this one only after verifying the JWT, and that strip is the entire reason it can be trusted. act-as: the client's REQUEST, deliberately outside the x-df- namespace so nothing about the name suggests it was checked; honoured only when x-df-sub's account has role admin, and ignored -- not refused -- for everyone else. host: which FetchPoint is addressed. The API and every FetchPoint arrive on the SAME listener, on the same port, from the same backend, so without this the program cannot tell one from another; it is the routing key, and the ONE header here the client controls end to end -- it may SELECT a FetchPoint and must never confer authority. x-real-ip: the edge's observation, SET from the connection it terminated, so unlike x-forwarded-for (which proxies append to and a client can seed) it has one writer the deployment owns. x-real-port and x-edge are the NAT-observation pair, set the same way. Eight names, under the per-direction cap of sixteen. The host joins repeated headers with ', ', so a second x-df-sub would arrive concatenated rather than as something the program could tell apart; a proxy's set-header replaces, which is what keeps that unreachable. What a reply's headers map may set -- an off-list name is dropped whole by the host, never cleaned. location serves the redirect kind; cache-control because a reflect or advertise answer cached is a wrong answer; the CORS name because reflect is only half useful if a browser on someone else's page cannot call it; allow and www-authenticate are the two the API's refusals have owed since the stub; retry-after rides on every 429 the meter answers. The framing names (content-length, connection, content-type) are the host's and would be refused here by name.",
+  "listeners": [
+    {
+      "scheme": "http",
+      "address": "0.0.0.0:8080",
+      "queue": "http_in",
+      "reply_queue": "http_out",
+      "max_body": 65536,
+      "deadline_ms": 5000,
+      "max_conns": 64,
+      "headers": [
+        "authorization", "x-df-sub", "act-as", "host",
+        "x-real-ip", "x-forwarded-for", "x-real-port", "x-edge"
+      ],
+      "response_headers": [
+        "location", "cache-control", "access-control-allow-origin",
+        "allow", "www-authenticate", "retry-after"
+      ]
+    }
+  ]
+}

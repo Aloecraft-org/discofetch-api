@@ -1,0 +1,74 @@
+-- df/label -- what a FetchPoint label is, and the two checks either side of it.
+--
+-- Extracted from supervisor.lua at B0, verbatim: everything here is PURE.
+-- No host, no db, no clock, no context -- which is why this module has no
+-- init() and why the model module can require it directly.
+--
+-- ====================================================== the surface block
+--
+-- Entry points:   M.valid_ip(s)
+--                 M.base32_from_hex(hex)
+--                 M.valid_label(s)
+--
+-- Configurable:   M.LABEL_BYTES -- 80 bits, exactly 16 symbols, no remainder.
+--                 B32 is the alphabet those symbols come from and is private:
+--                 changing it would change every label already issued.
+--
+-- ZONE and the ICE endpoints stay in supervisor.lua. They are deployment
+-- topology rather than label rules, and they belong in the file's own
+-- surface block where an operator looks for them.
+--
+-- ====================================================== end of the surface
+
+local M = {}
+
+local function valid_ip(s)
+  if type(s) ~= 'string' then return false end
+  local a, b, c, d = s:match('^(%d+)%.(%d+)%.(%d+)%.(%d+)$')
+  if a then
+    for _, o in ipairs({ a, b, c, d }) do
+      if #o > 3 or tonumber(o) > 255 then return false end
+    end
+    return true
+  end
+  return #s <= 45 and s:find(':', 1, true) ~= nil and s:match('^[0-9a-f:]+$') ~= nil
+end
+
+local B32 = 'abcdefghijklmnopqrstuvwxyz234567'
+local LABEL_BYTES = 10          -- 80 bits, exactly 16 symbols, no remainder
+
+-- crypto/random answers in HEX and a guest has no base32, so the regrouping
+-- happens here: 8-bit bytes in, 5-bit symbols out. Ten bytes divides into
+-- sixteen symbols with nothing left over, which is why the length is ten.
+local function base32_from_hex(hex)
+  local out, acc, nbits = {}, 0, 0
+  for i = 1, #hex, 2 do
+    acc = (acc << 8) | tonumber(hex:sub(i, i + 1), 16)
+    nbits = nbits + 8
+    while nbits >= 5 do
+      nbits = nbits - 5
+      local k = (acc >> nbits) & 31
+      out[#out + 1] = B32:sub(k + 1, k + 1)
+    end
+    acc = acc & ((1 << nbits) - 1)
+  end
+  return table.concat(out)
+end
+
+local function valid_label(s)
+  return type(s) == 'string' and #s == 16 and s:match('^[a-z2-7]+$') ~= nil
+end
+
+-- Draw, insert, and let the database refuse a duplicate. Never SELECT then
+-- INSERT: that races with itself, and the PRIMARY KEY is the only atomicity
+-- available without transactions.
+--
+-- At 80 bits the retry is theatre against collision -- it is real against two
+-- requests drawing in the same instant, which is the case it exists for.
+
+M.valid_ip         = valid_ip
+M.base32_from_hex  = base32_from_hex
+M.valid_label      = valid_label
+M.LABEL_BYTES      = LABEL_BYTES
+
+return M

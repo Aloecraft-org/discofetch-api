@@ -1,0 +1,377 @@
+-- df/grants -- what an account was given, and the quota that falls out of it.
+--
+-- Extracted from supervisor.lua at B0, behaviour unchanged.
+--
+-- ====================================================== the surface block
+--
+-- Entry points:   M.init(ctx)
+--                 M.validate_grant(spec, t)   M.grant_insert(account_id, g, source, t)
+--                 M.grant_object(r)           M.grant_by_id(id, t)
+--                 M.grants_of(account_id, t)  M.grant_live_sql(t)
+--                 M.quota_of(acct)   -- the three-way layering, below
+--                 M.GRANT_KINDS  M.GRANT_QUANTITY_MAX  M.GRANT_COLS
+--
+-- quota_of layers three ways with three different combining rules, and they
+-- are not interchangeable: quota_bonus is ADDITIVE, tier_grant is LAST-WINS
+-- OVERRIDE, and the base tier is a DEFAULT WITH FALLBACK. It also reports
+-- provenance as tier_source, because an account page reading tier `free`
+-- beside a plan of `Homelab` is otherwise a bug report. A typo DEGRADES and
+-- never outages: an unrecognised resource adds to nothing rather than to the
+-- wrong thing, and an unknown tier falls back rather than taking the account
+-- out.
+--
+-- The context: ctx.db, ctx.now, ctx.json, ctx.rows_by_name. Read at call
+-- time. TIERS and tier_of come from df/meter, required directly -- require is
+-- cached, so this is the instance supervisor already init()ed.
+--
+-- ====================================================== end of the surface
+
+local M = {}
+local C
+local MT = require('df.meter')
+
+function M.init(ctx)
+  assert(type(ctx) == 'table', 'grants.init: a context table, read at call time')
+  C = ctx
+end
+
+-- ------------------------------------------------------------- the grants
+--
+-- A grant is a gift with provenance: a tester's thank-you, a referral bonus
+-- and a paid pack are one row shape and differ only in `source`. The kinds
+-- are a registry for the same reason MT.TIERS and ROLES are -- the admin
+-- endpoint validates against this table rather than against a list spelled
+-- out at the call site, so adding a kind is one line and a typo'd one is a
+-- 400 rather than a row nothing will ever read.
+--
+--   quota_bonus  adds `quantity` to a cap. `detail.resource` says which --
+--                'fetchpoints' or 'tokens' -- and defaults to fetchpoints,
+--                which is the cap anyone means when they do not say.
+--   tier_grant   the account runs at `detail.tier` until `expires_at`.
+--   name_credit  N custom names, `spent` counting up as they are claimed.
+--                Nothing claims names yet: the column is modelled here and
+--                deliberately has no consumer, because a balance is only
+--                honest if it was counted from the day the grant was made.
+local GRANT_KINDS = { quota_bonus = true, tier_grant = true, name_credit = true }
+local GRANT_RESOURCES = { fetchpoints = true, tokens = true }
+
+-- WHEN A GRANT COUNTS, spelled once. Three clauses -- accepted, not
+-- withdrawn, not run out -- and every reader needs all three: the quota
+-- arithmetic, the redeem endpoint's answer, and the `active` flag on
+-- /v1/me. Three copies of it would disagree the first time one learns
+-- something the others did not, and the copy that drifts is the one
+-- deciding what somebody paid for.
+--
+-- `t` is INTERPOLATED rather than bound, which is safe in the one direction
+-- that matters: it is always C.now(), an integer this program computed, never
+-- anything a caller sent. Binding it would put its parameter number at the
+-- mercy of which query the fragment is pasted into -- the same argument the
+-- event page makes for its LIMIT -- and the two readers below number their
+-- binds differently.
+local function grant_live_sql(t)
+  return '(redeemed_at IS NOT NULL AND revoked_at IS NULL'
+    .. ' AND (expires_at IS NULL OR expires_at > ' .. t .. '))'
+end
+
+local GRANT_QUANTITY_MAX = 100000     -- a bonus larger than this is a typo
+
+-- WHAT A GRANT MAY SAY, checked once. Two doors now offer grants -- the
+-- operator handing one over directly, and an invite's `confers` promising
+-- them to whoever redeems the code -- and both must refuse the same shapes
+-- with the same codes, because a confers entry IS a deferred call to the
+-- direct endpoint. Two copies of this validation would drift, and the copy
+-- that drifts is the one deciding what a code someone already mailed out
+-- actually confers. `source` is deliberately NOT here: it is provenance,
+-- which each door knows and the grant itself does not.
+--
+-- Returns {kind, quantity, detail, expires_at} normalised, or nil plus the
+-- payload to refuse with -- the same {error = {code, message}} shape every
+-- handler answers, so a caller wraps or returns it unchanged.
+local function validate_grant(spec, t)
+  if type(spec) ~= 'table' then
+    return nil, { error = { code = 'invalid_grant',
+                            message = 'a grant must be a JSON object' } }
+  end
+
+  local kind = spec.kind
+  if type(kind) ~= 'string' or not GRANT_KINDS[kind] then
+    return nil, { error = { code = 'invalid_kind',
+        message = 'kind must be quota_bonus, tier_grant or name_credit' } }
+  end
+
+  -- A whole number, and bounded at both ends. Zero is legal in the column
+  -- and meaningless for the two countable kinds -- a bonus of nothing is a
+  -- card the panel would draw promising nothing -- so those two demand one.
+  local quantity = spec.quantity
+  if quantity == nil then quantity = 0 end
+  if type(quantity) ~= 'number' or quantity ~= math.floor(quantity)
+      or quantity < 0 or quantity > GRANT_QUANTITY_MAX then
+    return nil, { error = { code = 'invalid_quantity',
+        message = 'quantity must be a whole number from 0 to ' .. GRANT_QUANTITY_MAX } }
+  end
+  if (kind == 'quota_bonus' or kind == 'name_credit') and quantity < 1 then
+    return nil, { error = { code = 'invalid_quantity',
+        message = 'a ' .. kind .. ' of zero grants nothing; send a quantity of 1 or more' } }
+  end
+
+  local detail = spec.detail
+  if detail == nil then detail = {} end
+  if type(detail) ~= 'table' then
+    return nil, { error = { code = 'invalid_detail',
+                            message = 'detail must be a JSON object' } }
+  end
+
+  -- The two kinds whose behaviour is DECIDED by detail get their key
+  -- validated here, because quota_of degrades rather than errors: a typo'd
+  -- resource or tier there adds nothing and takes nobody out, which is the
+  -- right behaviour at read time and the wrong one at write time. This is
+  -- the only moment anybody can be told.
+  if kind == 'quota_bonus' then
+    local res = detail.resource
+    if res == nil then res = 'fetchpoints' end
+    if type(res) ~= 'string' or not GRANT_RESOURCES[res] then
+      return nil, { error = { code = 'invalid_resource',
+          message = 'detail.resource must be fetchpoints or tokens' } }
+    end
+    detail.resource = res
+  elseif kind == 'tier_grant' then
+    if type(detail.tier) ~= 'string' or not MT.TIERS[detail.tier] then
+      return nil, { error = { code = 'invalid_grant_tier',
+          message = 'detail.tier must name a tier in the registry' } }
+    end
+  end
+
+  local expires_at = spec.expires_at
+  if expires_at ~= nil then
+    if type(expires_at) ~= 'number' or expires_at ~= math.floor(expires_at)
+        or expires_at <= t then
+      return nil, { error = { code = 'invalid_expiry',
+          message = 'expires_at must be a unix time in seconds, in the future' } }
+    end
+  end
+  -- A TIER GRANT ALWAYS EXPIRES, and visibly. That is the shape of the
+  -- product rather than a schema rule: a trial that evaporates and a
+  -- thank-you that does not are different things, and the pairing only means
+  -- something if the tier half is the one with an end on it. An operator who
+  -- means "permanently on Homelab" is describing account.tier and should
+  -- PATCH it.
+  if kind == 'tier_grant' and expires_at == nil then
+    return nil, { error = { code = 'expiry_required',
+        message = 'a tier_grant runs until a date and the date is shown to '
+          .. 'the account holder from the moment they accept; send expires_at, '
+          .. 'or change their tier if it is meant to be permanent' } }
+  end
+
+  return { kind = kind, quantity = quantity, detail = detail,
+           expires_at = expires_at }
+end
+
+-- The OFFER, written. One insert for both doors, for the reason the
+-- validator above is one function -- and it writes an offer and nothing
+-- else: redeemed_at and revoked_at are simply absent, their default the
+-- NULL that says neither has happened. An invite's confers land through
+-- here too, as offers, because the panel's card is the moment the person
+-- is handed the gift and a grant redeemed by machinery robs them of it.
+--
+-- expires_at is NULLABLE and the connector refuses a nil bind outright, so
+-- the column joins the statement only when there is a value -- the same
+-- construction log_event uses for its three optional columns.
+local function grant_insert(account_id, g, source, t)
+  local cols  = { 'account_id', 'kind', 'quantity', 'detail', 'source', 'offered_at' }
+  local binds = { account_id, g.kind, g.quantity, C.json.encode(g.detail or {}),
+                  source, t }
+  if g.expires_at then
+    cols[#cols + 1]  = 'expires_at'
+    binds[#binds + 1] = g.expires_at
+  end
+  local marks = {}
+  for i = 1, #binds do marks[i] = '?' .. i end
+  return C.db.exec('INSERT INTO account_grant (' .. table.concat(cols, ', ')
+    .. ') VALUES (' .. table.concat(marks, ', ') .. ')', table.unpack(binds)).rowid
+end
+
+-- Every column of the row except `account_id`, which is not news to either
+-- reader: /v1/me's list is the caller's own, and the operator asked for one
+-- account by id. `detail` is DECODED rather than passed through as a string,
+-- the same bargain event_object makes -- a client reads a field instead of
+-- parsing JSON out of JSON.
+--
+-- `active` comes off the SQL fragment above rather than being recomputed
+-- here, which is the whole point of having one fragment: the flag the panel
+-- draws a card from and the arithmetic the cap is built from can never
+-- disagree about whether a gift is in force.
+--
+-- A missing timestamp is spelled by the key's ABSENCE, which is what a
+-- nullable column has always looked like in this API (log_event leaves the
+-- column out of the statement rather than binding nil), so no client learns
+-- a second spelling for "not yet".
+local GRANT_COLS = 'id, account_id, kind, quantity, detail, source,'
+  .. ' offered_at, redeemed_at, expires_at, revoked_at, spent'
+
+local function grant_object(r)
+  local detail = {}
+  if type(r.detail) == 'string' then
+    local okd, d = pcall(C.json.decode, r.detail)
+    if okd and type(d) == 'table' then detail = d end
+  end
+  return {
+    id          = r.id,
+    kind        = r.kind,
+    quantity    = r.quantity,
+    spent       = r.spent,
+    detail      = detail,
+    source      = r.source,
+    offered_at  = r.offered_at,
+    redeemed_at = r.redeemed_at,
+    expires_at  = r.expires_at,
+    revoked_at  = r.revoked_at,
+    active      = r.active == 1,
+  }
+end
+
+-- One grant, whole, with the live flag computed by the database. Both the
+-- redeem endpoint and the operator's create read their answer back through
+-- here rather than assembling one from what they just wrote: a response that
+-- describes the row is a response that cannot claim a redemption the UPDATE
+-- did not make.
+local function grant_by_id(id, t)
+  return C.rows_by_name(C.db.query('SELECT ' .. GRANT_COLS .. ', '
+    .. grant_live_sql(t) .. ' AS active FROM account_grant WHERE id = ? LIMIT 1',
+    id))[1]
+end
+
+-- The account's grants, newest first. OFFERED AND REDEEMED BOTH, and revoked
+-- and lapsed ones too: every row carries `active`, `redeemed_at` and
+-- `revoked_at`, so the panel decides what is a card and what is history --
+-- and a gift that was withdrawn disappearing from the list entirely is the
+-- one thing that guarantees a support conversation.
+--
+-- LIMITed for the reason every list here is: the connector REFUSES past its
+-- row cap rather than truncating, so an account with three hundred grants
+-- would answer 500 on the page it is most important to load.
+local ACCOUNT_GRANTS = 50
+
+local function grants_of(account_id, t)
+  return C.rows_by_name(C.db.query('SELECT ' .. GRANT_COLS .. ', '
+    .. grant_live_sql(t) .. ' AS active FROM account_grant'
+    .. ' WHERE account_id = ? ORDER BY id DESC LIMIT ' .. ACCOUNT_GRANTS,
+    account_id))
+end
+
+-- The ceiling on how many live grants one account's quota arithmetic will
+-- read. It is not a business rule -- grants arrive one at a time from an
+-- operator -- it is the connector: max_result_rows REFUSES past 256 rather
+-- than truncating, so an unbounded SELECT here would turn a generous account
+-- into a 500 on every create. A hundred live gifts on one account is an
+-- operator question long before it is an arithmetic one.
+local QUOTA_GRANT_ROWS = 100
+
+-- What the tier allows, and what the account holds against it. Its own
+-- function because there are two readers now: the customer's own /v1/me, and
+-- the operator's account detail -- which exists to answer "why is their
+-- create failing" and can only answer it with the arithmetic the create
+-- itself does. Two copies of a tier calculation drift, and the copy that
+-- drifts is the one being read aloud on a support call. The create gates
+-- read it too, for that reason: NOTHING ELSE IN THIS PROGRAM COMPUTES A CAP.
+--
+-- used counts LIVE rows only, matching the list and the create gate, so
+-- deleting one visibly returns headroom. Tokens the same way: a revoked row
+-- is history, and counting it would mean revoking never returns headroom.
+--
+-- ADDITIVE since grants landed: an active tier_grant overrides the account's
+-- tier column, and live quota_bonus rows add to the cap on top. The answer
+-- carries `base` and `bonus` beside `limit` because "25 of 25" with no
+-- explanation is how a support ticket starts -- and because the day someone
+-- disputes their cap, the number and its two halves have to come out of the
+-- same call rather than out of a reconstruction.
+--
+-- ONE query for every grant on the account, not one per grant: this runs on
+-- the create path, and the per-resource split lives inside a JSON column, so
+-- the summing is done here rather than by a GROUP BY that cannot see into
+-- `detail`.
+local function quota_of(acct)
+  local t = C.now()
+  local used = C.db.query([[SELECT COUNT(*) FROM fetchpoint
+                           WHERE owner_account_id = ? AND deleted_at IS NULL]],
+                        acct.id).rows[1][1]
+  local tokens = C.db.query([[SELECT COUNT(*) FROM api_token
+                             WHERE account_id = ? AND revoked_at IS NULL]],
+                          acct.id).rows[1][1]
+
+  -- Positional rather than rows_by_name, which is declared further down this
+  -- file; the column order is right here, three columns long.
+  local granted_tier, bonus = nil, { fetchpoints = 0, tokens = 0 }
+  local gq = C.db.query('SELECT kind, quantity, detail FROM account_grant'
+    .. ' WHERE account_id = ? AND ' .. grant_live_sql(t)
+    .. ' ORDER BY id LIMIT ' .. QUOTA_GRANT_ROWS, acct.id)
+  for _, r in ipairs(gq.rows) do
+    local kind, quantity, raw = r[1], r[2], r[3]
+    local detail = {}
+    if type(raw) == 'string' then
+      local okd, d = pcall(C.json.decode, raw)
+      if okd and type(d) == 'table' then detail = d end
+    end
+    if kind == 'quota_bonus' then
+      -- fetchpoints is what a bonus means when it does not say, and an
+      -- unrecognised resource adds to nothing rather than to the wrong
+      -- thing: a typo must be visible as "my bonus did nothing", never as
+      -- headroom on a cap nobody granted.
+      local res = detail.resource
+      if res == nil then res = 'fetchpoints' end
+      if GRANT_RESOURCES[res] and type(quantity) == 'number' and quantity > 0 then
+        bonus[res] = bonus[res] + quantity
+      end
+    elseif kind == 'tier_grant' then
+      -- Last one offered wins, and an unknown tier is ignored for the same
+      -- reason tier_of falls back rather than erroring: a typo'd tier must
+      -- degrade to the account's own, never take the account out.
+      if type(detail.tier) == 'string' and MT.TIERS[detail.tier] then
+        granted_tier = detail.tier
+      end
+    end
+  end
+
+  -- The effective tier, which is the granted one when there is one. `tier`
+  -- has always been the name the caps below were computed from, so it keeps
+  -- meaning that -- and `tier_source` says which column it came out of,
+  -- because an account page reading tier 'free' beside a plan of 'Homelab'
+  -- is otherwise a bug report.
+  local tier = MT.TIERS[acct.tier] and acct.tier or 'free'
+  local source = 'account'
+  if granted_tier then tier, source = granted_tier, 'grant' end
+  local lim = MT.tier_of(tier)
+
+  return {
+    tier                  = tier,
+    tier_source           = source,
+    plan                  = lim.title,
+    fetchpoints           = { used = used, base = lim.fetchpoints,
+                              bonus = bonus.fetchpoints,
+                              limit = lim.fetchpoints + bonus.fetchpoints },
+    tokens                = { used = tokens, base = lim.tokens,
+                              bonus = bonus.tokens,
+                              limit = lim.tokens + bonus.tokens },
+    dns_updates_per_hour  = lim.dns_per_hour,
+    room_joins_per_minute = lim.joins_per_min,
+  }
+end
+
+-- ASSEMBLED BY HAND, since grants landed. json.encode cannot spell an empty
+-- array -- a Lua table with no entries has no shape to read -- and "no
+-- grants" is not an edge case here, it is what every account answers until
+-- somebody is given something. A panel that branches on `{}` versus `[]` on
+-- the page it loads first is a panel that breaks for everyone but testers.
+-- The body without the resolution, because /v1/me now has two callers with
+
+M.GRANT_KINDS        = GRANT_KINDS
+M.GRANT_QUANTITY_MAX = GRANT_QUANTITY_MAX
+M.GRANT_COLS         = GRANT_COLS
+M.grant_live_sql     = grant_live_sql
+M.validate_grant     = validate_grant
+M.grant_insert       = grant_insert
+M.grant_object       = grant_object
+M.grant_by_id        = grant_by_id
+M.grants_of          = grants_of
+M.quota_of           = quota_of
+
+return M

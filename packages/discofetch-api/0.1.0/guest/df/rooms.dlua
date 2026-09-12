@@ -1,0 +1,155 @@
+-- df/rooms -- rooms: TTL'd presence sets held in memory, and the two header tables that keep their answers uncached
+--
+-- Extracted from supervisor.lua at B0. The body is unchanged apart from
+-- reaching shared state through the context, which a module cannot take from
+-- a main-chunk upvalue.
+--
+-- ====================================================== the surface block
+--
+-- Entry points:   M.init(ctx) once, before anything below is called
+--                 M.ROOMS
+--                 M.ROOMS_GLOBAL_MAX
+--                 M.room_prune
+--                 M.room_list
+--                 M.room_join
+--                 M.PUBLIC_READ
+--                 M.NO_STORE
+--                 M.room_allowed
+--                 M.valid_room
+--                 M.rooms_count
+--
+-- The context is read at CALL time, not at init: `db` is not open when a
+-- module loads -- it arrives when migrate() wins, after every require.
+--
+-- ====================================================== end of the surface
+
+local M = {}
+local C
+
+function M.init(ctx)
+  assert(type(ctx) == 'table', 'rooms.init: a context table, read at call time')
+  C = ctx
+end
+
+-- ------------------------------------------------------------- the rooms
+--
+-- STORAGE TIER: MEMORY, ON PURPOSE. Room candidates are presence, not
+-- history -- Bob's laptop at the atrium-west AP for the next five minutes
+-- -- and presence with a TTL is restart-tolerant by construction: every
+-- member re-joins on an interval, so losing the table to a deploy costs
+-- one refresh cycle of visibility and zero facts. What memory buys is the
+-- spike: a conference's top-of-the-hour stampede becomes table writes in
+-- the root program's own heap instead of a database transaction per hello.
+-- What it PROMISES is better: these addresses never touch disk. Two
+-- invariants keep that promise true -- this deployment must never enable
+-- hibernation for the root instance (a snapshot would persist what we
+-- said never lands), and nothing below ever writes a candidate through
+-- the sql connector. This table IS the storage seam: a 'durable' room
+-- tier later is a second implementation behind these three functions,
+-- chosen per fetchpoint by a retention config field, not a rewrite.
+--
+-- Shape: ROOMS[fp_id][room][addr..'#'..port] = {address, port, name, at}.
+-- Pruning is lazy (on touch) plus capacity-checked on join; the global
+-- cap is a memory backstop far above any honest use.
+
+local ROOMS = {}
+local ROOMS_MAX_PER_FP = 256       -- distinct rooms one fetchpoint may hold
+local ROOMS_GLOBAL_MAX = 100000    -- candidates across everything; backstop
+local rooms_count = 0
+
+local function room_prune(fp_id, room, ttl, t)
+  local rs = ROOMS[fp_id] and ROOMS[fp_id][room]
+  if not rs then return end
+  for k, c in pairs(rs) do
+    if c.at <= t - ttl then rs[k] = nil; rooms_count = rooms_count - 1 end
+  end
+  if next(rs) == nil then ROOMS[fp_id][room] = nil end
+  if ROOMS[fp_id] and next(ROOMS[fp_id]) == nil then ROOMS[fp_id] = nil end
+end
+
+local function room_list(fp_id, room, ttl, t)
+  room_prune(fp_id, room, ttl, t)
+  local out = {}
+  local rs = ROOMS[fp_id] and ROOMS[fp_id][room]
+  if rs then for _, c in pairs(rs) do out[#out + 1] = c end end
+  table.sort(out, function(a, b) return a.at > b.at end)
+  return out
+end
+
+-- Returns the list after the join, or nil plus a refusal.
+local function room_join(fp_id, room, ttl, capacity, cand, t)
+  room_prune(fp_id, room, ttl, t)
+  ROOMS[fp_id] = ROOMS[fp_id] or {}
+  local fpr = ROOMS[fp_id]
+  if not fpr[room] then
+    local nrooms = 0
+    for _ in pairs(fpr) do nrooms = nrooms + 1 end
+    if nrooms >= ROOMS_MAX_PER_FP then
+      return nil, 'room_limit', 'this fetchpoint holds its maximum number of rooms'
+    end
+    fpr[room] = {}
+  end
+  local rs = fpr[room]
+  -- A peer-shaped entry (doc/ICE.md 3) is keyed by its ufrag: unique per
+  -- session by construction, and what the other side needs anyway. A
+  -- plain candidate keeps address#port, so a re-join refreshes it.
+  local key = cand.ufrag and ('u#' .. cand.ufrag)
+           or (cand.address .. '#' .. tostring(cand.port or 0))
+  if not rs[key] then
+    local n = 0
+    for _ in pairs(rs) do n = n + 1 end
+    if n >= capacity then
+      return nil, 'room_full', 'this room holds its capacity of ' .. capacity
+    end
+    if rooms_count >= ROOMS_GLOBAL_MAX then
+      return nil, 'rooms_saturated', 'the rendezvous store is at its global cap'
+    end
+    rooms_count = rooms_count + 1
+  end
+  rs[key] = cand
+  return room_list(fp_id, room, ttl, t)
+end
+
+-- observed_address lives up in the helpers now -- the waitlist limiter
+-- keys on it, and a local defined below a function that calls it would
+-- never be captured.
+
+-- Answers about the present moment must not be cached, and the read views
+-- carry CORS because a browser on someone else's page is half the
+-- audience: a JS snippet asking "what do I look like" or "where is the
+-- home box" is exactly the product.
+local PUBLIC_READ = { ['cache-control'] = 'no-store',
+                      ['access-control-allow-origin'] = '*' }
+local NO_STORE = { ['cache-control'] = 'no-store' }
+
+-- Who may join or read a room, per the owner's config. 'open' is the
+-- secret-meeting-id pattern when paired with an unguessable room name;
+-- 'pin' is a human-typeable secret; 'key' is the owner's own credential.
+local function room_allowed(cfg, req)
+  local mode = cfg.room_auth or 'key'
+  if mode == 'open' then return true end
+  if mode == 'pin' then
+    return cfg.room_pin ~= nil and req.query.pin == cfg.room_pin
+  end
+  local key = req.authorization and req.authorization:match('^[Bb]earer%s+(.+)$')
+    or req.query.key
+  return cfg.advertise_key ~= nil and key == cfg.advertise_key
+end
+
+local function valid_room(name)
+  return type(name) == 'string' and #name >= 1 and #name <= 64
+     and name:match('^[%w%-_]+$') ~= nil
+end
+
+function M.rooms_count_get() return rooms_count end
+M.ROOMS              = ROOMS
+M.ROOMS_GLOBAL_MAX   = ROOMS_GLOBAL_MAX
+M.room_prune         = room_prune
+M.room_list          = room_list
+M.room_join          = room_join
+M.PUBLIC_READ        = PUBLIC_READ
+M.NO_STORE           = NO_STORE
+M.room_allowed       = room_allowed
+M.valid_room         = valid_room
+
+return M
