@@ -39,6 +39,7 @@ local EV   = require('df.event_log')
 local GRN  = require('df.grants')
 local IDN  = require('df.identity')
 local FP   = require('df.fetchpoint')
+local PP   = require('df.peer_program')
 
 -- ── what the handlers below reach for ──────────────────────────────────
 -- One bind block, mirroring the one supervisor.lua used to carry, so every
@@ -71,6 +72,19 @@ local log_event = EV.log_event
 local API_VERSION = 'v1'
 local SLUG        = '([%w%-_]+)'
 local claim_label
+
+-- ── the config a room hands a peer ─────────────────────────────────────
+-- Defaults for the one file GET .../rooms/<code>/config returns. Here with
+-- the route surface because they are the deployment's answer to "what does
+-- a peer run", not a caller's choice: everything a caller MAY set arrives
+-- as a query parameter and is validated at the handler.
+local PEER_NET       = '10.77.'   -- the tunnel /16; peers take .a.b inside it
+local PEER_MTU       = 1420       -- WireGuard's own default, minus nothing
+local PEER_PORT      = 51820      -- listen_port; the mapping is measured, not assumed
+local PEER_EXPOSE    = 22         -- what is reachable at this peer's tunnel address
+local PEER_TIMEOUT_S = 600        -- how long to wait for somebody else in the room
+local PEER_STALE_S   = 300        -- a link silent this long is remapped
+local PEER_KEY_ENV   = 'WG_KEY'   -- the private key NEVER travels; the peer sets this
 
 function M.init(ctx)
   assert(type(ctx) == 'table', 'api.init: a context table, read at call time')
@@ -1065,6 +1079,176 @@ end
 -- counters the zone path bumps. Zeros rather than absence when nothing
 -- happened yet, because the panel needs numbers, not a shape puzzle --
 -- and `since` plus `storage` say exactly what window is being claimed.
+-- ── depth: the config a room hands a peer ──────────────────────────────
+-- ONE file. `program.source` carries the rendezvous program inline and the
+-- settings ride in `args`, so a machine with nothing but `drt` on it runs
+-- this and needs no second file, no interpreter and no privilege. That is
+-- the whole last mile: wg.sh writes four files and asks for root; this is
+-- a download and `drt start --config`.
+--
+-- It is OWNER-ONLY and it is a CREDENTIAL ISSUE, not a read. The config
+-- carries the fetchpoint's advertise key, which every other read masks
+-- (model.dlua marks it secret = true), because the peer has to join the
+-- room with it. So: the owner's own account, and an event row per issue --
+-- the same bar advertisement_put is held to, for the same reason.
+
+-- A peer's tunnel address and name, derived from its public key. Two
+-- callers who send the same key get the same address, which is what makes
+-- a re-download idempotent rather than a second identity in the room.
+--
+-- NOT a real allocator: there is no peer table yet (FETCHPOINT-DESIGN §2.1
+-- is the shape, and rooms hold membership in memory), so this cannot check
+-- what is already taken. Two keys in one room collide at about 1 in 65536
+-- per pair -- ~0.2% across a full sixteen-peer room -- and the symptom
+-- would be two peers answering to one address. `?address=` is the escape
+-- hatch until peers are rows and this becomes a query.
+local function peer_ident(pubkey)
+  local h = 5381
+  for i = 1, #pubkey do
+    h = (h * 33 + pubkey:byte(i)) % 4294967296
+  end
+  local a, b = math.floor(h / 256) % 254 + 1, h % 254 + 1
+  return PEER_NET .. a .. '.' .. b, 'peer-' .. string.format('%08x', h)
+end
+
+-- Base64 of 32 bytes: 43 characters and '='. Checked because a bad key is
+-- silent -- WireGuard would simply never complete a handshake with the
+-- other side, and the peer would sit in a room that looks healthy.
+local function valid_pubkey(k)
+  return type(k) == 'string' and #k == 44 and k:sub(44) == '='
+     and k:sub(1, 43):match('^[%w+/]+$') ~= nil
+end
+
+local function rooms_config_get(req, p)
+  local acct, status, payload = resolve_account(req)
+  if not acct then return status, payload end
+  local q = C.db.query([[SELECT id, label, kind, config, source, access, channel,
+                                behavior, subject, entry_ttl, room_lifetime
+                           FROM fetchpoint
+                          WHERE label = ? AND owner_account_id = ?
+                            AND deleted_at IS NULL LIMIT 1]], p.label, acct.id)
+  local r = C.rows_by_name(q)[1]
+  if not r then
+    return 404, { error = { code = 'not_found', message = 'no such fetchpoint' } }
+  end
+
+  local d, cfg = DIM.of(r)
+  if not d.rooms then
+    return 409, { error = { code = 'rooms_disabled',
+      message = 'this fetchpoint does not carry rooms; PATCH rooms=true first' } }
+  end
+
+  -- The room must be CLAIMED. A config for a room nobody opened would be a
+  -- config for a room whose policy nothing has decided -- and the claim is
+  -- what decides capacity, ttl and the door (rooms.dlua, §5.3).
+  local t = C.now()
+  local room = ROO.room_by_code(r.id, p.room, t)
+  if not room then
+    return 404, { error = { code = 'no_such_room',
+      message = 'no open room with that code; claim one with --open first' } }
+  end
+
+  local key = cfg and cfg.advertise_key
+  if not key or key == '' then
+    return 409, { error = { code = 'no_advertise_key',
+      message = 'this fetchpoint has no advertise key for a peer to join with' } }
+  end
+
+  local query = req.query or {}
+  if not valid_pubkey(query.pubkey) then
+    return 400, { error = { code = 'invalid_value',
+      message = 'pubkey is the peer\'s WireGuard public key: 44 characters of base64' } }
+  end
+
+  local expose = PEER_EXPOSE
+  if query.expose and query.expose ~= '' then
+    expose = tonumber(query.expose)
+    if not expose or expose ~= math.floor(expose) or expose < 1 or expose > 65535 then
+      return 400, { error = { code = 'invalid_value',
+        message = 'expose is a port, 1..65535' } }
+    end
+  end
+
+  local addr, name = peer_ident(query.pubkey)
+  if query.address and query.address ~= '' then
+    if not valid_ip(query.address:gsub('/%d+$', '')) then
+      return 400, { error = { code = 'invalid_value',
+        message = 'address is this peer\'s tunnel address' } }
+    end
+    addr = query.address:gsub('/%d+$', '')
+  end
+  if query.name and query.name ~= '' then
+    if not ROO.valid_room(query.name) then
+      return 400, { error = { code = 'invalid_value',
+        message = 'name is 1..64 of letters, digits, - and _' } }
+    end
+    name = query.name
+  end
+
+  local zone, label = C.ZONE, r.label
+  local origin = 'https://' .. label .. '.' .. zone
+  local cfg_out = {
+    _this = 'One end of a punched WireGuard tunnel, from room ' .. room.shortcode
+         .. '. Run it with: drt start --config <this file>. The peer is not '
+         .. 'named here -- the room supplies it at run time. WG_KEY must hold '
+         .. 'this machine\'s WireGuard private key; it is never sent to us.',
+    program = { source = PP.SOURCE },
+    args = {
+      fetchpoint = label,
+      zone       = zone,
+      room       = room.shortcode,
+      name       = name,
+      key        = key,
+      public_key = query.pubkey,
+      address    = addr,
+      timeout_s  = PEER_TIMEOUT_S,
+      stale_s    = PEER_STALE_S,
+    },
+    wireguard = {
+      listen_port     = PEER_PORT,
+      -- userspace, always. The journey this serves is a person with no root
+      -- on the box: kernel mode needs an adapter and CAP_NET_ADMIN, and a
+      -- config we hand out cannot assume either.
+      mode            = 'userspace',
+      expose          = { { tunnel = addr .. ':' .. expose,
+                            to     = '127.0.0.1:' .. expose } },
+      address         = addr .. '/32',
+      mtu             = PEER_MTU,
+      private_key_env = PEER_KEY_ENV,
+      stun            = { 'stun1.' .. zone .. ':3478', 'stun2.' .. zone .. ':3478' },
+      queue           = 'wg_in',
+      reply_queue     = 'wg_out',
+      report_ms       = 2000,
+    },
+    -- No fs. The settings ride in args, so the peer needs no second file --
+    -- and a config that cannot read the disk is one a reader can audit in
+    -- the time it takes to scroll it.
+    caps = { { capability = 'host:rest/*' }, { capability = 'host:time' } },
+    connectors = {
+      time = {},
+      rest = { scope = { allow = {
+        { origin = origin,
+          allow_headers = { 'authorization', 'accept' } },
+        { origin = 'https://' .. label .. '--join.' .. zone,
+          allow_headers = { 'authorization', 'accept' } },
+        { origin = 'https://' .. label .. '--outcome.' .. zone,
+          allow_headers = { 'authorization', 'accept' } },
+      } } },
+    },
+  }
+
+  -- Not `detail = { key = ... }`. The row is readable by the owner AND by
+  -- audit, and the whole reason this event exists is that a credential left
+  -- the building -- writing the credential into the record of it leaving
+  -- would put the secret everywhere the audit trail goes.
+  log_event('fetchpoint.config_issued', acct.id, acct, {
+    fetchpoint_id = r.id, label = label, address = req.real_ip,
+    detail = { room = room.shortcode, name = name,
+               tunnel_address = addr, program = PP.DIGEST },
+  })
+  return 200, cfg_out
+end
+
 local function fetchpoints_traffic(req, p)
   local fp, status, payload = owned_fetchpoint(req, p)
   if not fp then return status, payload end
@@ -3690,6 +3874,11 @@ local ROUTES = {
   -- Sub-resources FIRST. Not strictly load-bearing while the slug class
   -- excludes '/', but the day someone widens it is the day it becomes so
   -- and nobody will remember.
+  -- The last mile: one runnable config for one peer in one room. Before
+  -- the advertisement routes only because sub-resources go first and this
+  -- is the deepest of them.
+  { 'GET',    '^/v1/fetchpoints/' .. SLUG .. '/rooms/' .. SLUG .. '/config$',
+                                                        rooms_config_get, 'label', 'room' },
   { 'PUT',    '^/v1/fetchpoints/' .. SLUG .. '/advertisement$',  advertisement_put,    'label' },
   { 'DELETE', '^/v1/fetchpoints/' .. SLUG .. '/advertisement$',  advertisement_delete, 'label' },
   { 'GET',    '^/v1/fetchpoints/' .. SLUG .. '/traffic$',        fetchpoints_traffic,  'label' },

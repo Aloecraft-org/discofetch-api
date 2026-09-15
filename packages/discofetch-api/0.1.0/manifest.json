@@ -15,6 +15,7 @@
       "df.label": "guest/df/label.dlua",
       "df.meter": "guest/df/meter.dlua",
       "df.model": "guest/df/model.dlua",
+      "df.peer_program": "guest/df/peer_program.dlua",
       "df.rooms": "guest/df/rooms.dlua"
     },
     "source_only": true
@@ -30,7 +31,7 @@
   },
   "files": {
     "guest/api.dlua": "sha256:6515432cd5d7e9f3e90fa8547b133359217402264c758c931452fda12c02880e",
-    "guest/df/api.dlua": "sha256:9b21fba0bdcae2cf0e4591409f1ea4b36b1d6e8c6b41f3d7b71646bd31fb7497",
+    "guest/df/api.dlua": "sha256:f4ea652aae47d04722b989b1171d9b2925e60dc615b70d9e655ba8d137e094bc",
     "guest/df/event_log.dlua": "sha256:cd572d0abec68e6e95f3027daf49a8772fe09a5ac1fc222884a27a3ed59f4b0e",
     "guest/df/fetchpoint.dlua": "sha256:7736768e7eba7e6b4d298719bec14f0f45f1499162b6863e983a02e81844f9b9",
     "guest/df/grants.dlua": "sha256:f2be431dc6458e969282b61325a586ed1d47bdaa8cd1ce0423eb140944a92fd4",
@@ -39,6 +40,7 @@
     "guest/df/label.dlua": "sha256:d538153d280f06950036fd39b243a07f56586e6f87686e8b0b39bd94110fafc7",
     "guest/df/meter.dlua": "sha256:11f9b08996f9f178271529322088c7f9cbb2b6309dca2a1b85191857fcd45be5",
     "guest/df/model.dlua": "sha256:90ec3dbdf0e81634e0c62703b90220981ce44e5b8479b90c6536c64a7691dddc",
+    "guest/df/peer_program.dlua": "sha256:9850c629ea013fdb8c9ea745938005d44fb2591cb6c662eb2952052529289544",
     "guest/df/rooms.dlua": "sha256:4db6954fc52273bf4ba34f0641e07dd0cc2ad5a9f1a4d686d9ebe2491fd84a45"
   }
 }
