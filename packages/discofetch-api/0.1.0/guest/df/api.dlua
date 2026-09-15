@@ -1114,9 +1114,22 @@ end
 -- Base64 of 32 bytes: 43 characters and '='. Checked because a bad key is
 -- silent -- WireGuard would simply never complete a handshake with the
 -- other side, and the peer would sit in a room that looks healthy.
-local function valid_pubkey(k)
-  return type(k) == 'string' and #k == 44 and k:sub(44) == '='
-     and k:sub(1, 43):match('^[%w+/]+$') ~= nil
+--
+-- CANONICALISED FIRST, and that is not leniency. A `+` in a query string
+-- means SPACE, and a base64 key is 43 characters each with a 1-in-64 chance
+-- of being one, so about HALF of all WireGuard keys contain a `+` -- which
+-- means `?pubkey=$(wg genkey | wg pubkey)`, the obvious command and the one
+-- every guide shows, arrives here with the plus already eaten. Refusing it
+-- would make the main path the broken one and the workaround the documented
+-- one. No valid key contains a space, so putting it back is not a guess.
+-- URL-safe base64 is folded in the same way and for the same reason.
+local function canon_pubkey(k)
+  if type(k) ~= 'string' then return nil end
+  k = k:gsub(' ', '+'):gsub('%-', '+'):gsub('_', '/')
+  if #k == 44 and k:sub(44) == '=' and k:sub(1, 43):match('^[%w+/]+$') then
+    return k
+  end
+  return nil
 end
 
 local function rooms_config_get(req, p)
@@ -1155,9 +1168,11 @@ local function rooms_config_get(req, p)
   end
 
   local query = req.query or {}
-  if not valid_pubkey(query.pubkey) then
+  local pubkey = canon_pubkey(query.pubkey)
+  if not pubkey then
     return 400, { error = { code = 'invalid_value',
-      message = 'pubkey is the peer\'s WireGuard public key: 44 characters of base64' } }
+      message = 'pubkey is the peer\'s WireGuard public key: 44 characters of base64, '
+             .. 'as `wg pubkey` prints it' } }
   end
 
   local expose = PEER_EXPOSE
@@ -1169,7 +1184,7 @@ local function rooms_config_get(req, p)
     end
   end
 
-  local addr, name = peer_ident(query.pubkey)
+  local addr, name = peer_ident(pubkey)
   if query.address and query.address ~= '' then
     if not valid_ip(query.address:gsub('/%d+$', '')) then
       return 400, { error = { code = 'invalid_value',
@@ -1199,7 +1214,7 @@ local function rooms_config_get(req, p)
       room       = room.shortcode,
       name       = name,
       key        = key,
-      public_key = query.pubkey,
+      public_key = pubkey,
       address    = addr,
       timeout_s  = PEER_TIMEOUT_S,
       stale_s    = PEER_STALE_S,

@@ -31,7 +31,7 @@
   },
   "files": {
     "guest/api.dlua": "sha256:6515432cd5d7e9f3e90fa8547b133359217402264c758c931452fda12c02880e",
-    "guest/df/api.dlua": "sha256:f4ea652aae47d04722b989b1171d9b2925e60dc615b70d9e655ba8d137e094bc",
+    "guest/df/api.dlua": "sha256:977c10a15d9c54566f6ec267aba815e299a35e9a98213c9a1b19e410987165e7",
     "guest/df/event_log.dlua": "sha256:cd572d0abec68e6e95f3027daf49a8772fe09a5ac1fc222884a27a3ed59f4b0e",
     "guest/df/fetchpoint.dlua": "sha256:7736768e7eba7e6b4d298719bec14f0f45f1499162b6863e983a02e81844f9b9",
     "guest/df/grants.dlua": "sha256:f2be431dc6458e969282b61325a586ed1d47bdaa8cd1ce0423eb140944a92fd4",
