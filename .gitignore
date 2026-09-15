@@ -17,3 +17,4 @@ dollup.json
 dollup.lock
 .dollup/
 data/
+.nogit
