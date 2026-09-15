@@ -1,0 +1,108 @@
+-- df/keys -- the trust root a fetchpoint is born with (ROOMS-SPEC §6.1)
+--
+-- §6.1: "Any entity (account, fetchpoint, room) can hold a keypair and issue
+-- or validate tokens; a private key may exist only in memory inside a node."
+-- On drt 0.7.0-rc.1 that last clause is not a design goal to work toward, it
+-- is how the crypto connector already behaves, so this module is thin:
+--
+--   host.call('crypto/derive', { label = 'fetchpoint:7' })
+--
+-- registers a key under that name INSIDE the connector and returns nothing.
+-- The bytes never enter this program's heap, never reach the database, and
+-- never appear in a snapshot. Afterwards `crypto/jwt_sign` and `crypto/hmac`
+-- take `key = 'fetchpoint:7'` and the connector supplies what it kept -- and
+-- jwt_sign puts the name in the token's `kid` header, which is why the name
+-- is the only part worth storing.
+--
+-- So a fetchpoint's key is a pure function of (the deployment's signing key,
+-- this label). That is what makes it "stable across hibernation" without
+-- being persisted: a restart re-derives the same key from the same two
+-- inputs. The keypair row records WHICH label is current, not a secret.
+--
+-- HS256 is symmetric, so there is no public half today. keypair.pubkey is
+-- nullable and stays NULL until a host capability exists that makes one.
+--
+-- ====================================================== the surface block
+--
+-- Entry points:   M.init(ctx)      once, before anything below
+--                 M.kid            the label an entity's key is known by
+--                 M.ensure         derive it, idempotently; -> kid | nil, why
+--
+-- Configurable values:
+--                 KINDS            entities that may hold a key (§6.1)
+--                 DERIVE/SIGN/MAC  the connector calls, named once
+--
+-- Fan-out: KINDS is the whole set. A kind not listed here cannot hold a key,
+-- because the deployment's grant names label patterns one prefix at a time
+-- (api.config.json, caps[host:crypto/derive].scope) and a prefix nobody
+-- granted is refused by the connector rather than silently signing with the
+-- deployment key.
+--
+-- ====================================================== end of the surface
+
+local M = {}
+local C
+
+local DERIVE = 'crypto/derive'
+
+-- Both are granted in api.config.json. `account` is listed because §6.1 names
+-- it and the cost of the third pattern is one line in a config; nothing
+-- derives one yet.
+local KINDS = { fetchpoint = true, room = true, account = true }
+
+function M.init(ctx)
+  assert(type(ctx) == 'table', 'keys.init: a context table, read at call time')
+  C = ctx
+end
+
+-- ------------------------------------------------------------- the label
+--
+-- `<kind>:<id>`, and a rotation appends a generation -- `fetchpoint:7:2`.
+-- The deployment grants `fetchpoint:*`, which covers the generation too, so
+-- rotating a key is a row change here and not a config change on fetch1.
+function M.kid(kind, id, generation)
+  if not KINDS[kind] then return nil end
+  if id == nil then return nil end
+  local base = kind .. ':' .. tostring(id)
+  if generation and generation > 1 then return base .. ':' .. tostring(generation) end
+  return base
+end
+
+-- depth: derive, and remember that we did
+--
+-- The connector forgets derived labels when the instance restarts, so this
+-- memo is per-instance by construction -- exactly matching what it caches.
+-- Re-deriving is cheap and idempotent; the memo is here so the common path
+-- (every token this fetchpoint issues) is not a hostcall to learn nothing.
+local derived = {}
+
+-- -> kid, or nil and the connector's sentence. NEVER raises: a create path
+-- calls this, and a fetchpoint that exists without a key is a smaller
+-- problem than a create that fails.
+function M.ensure(kind, id, generation)
+  local kid = M.kid(kind, id, generation)
+  if not kid then return nil, 'no key kind ' .. tostring(kind) end
+  if derived[kid] then return kid end
+  local ok, err = pcall(C.host.call, DERIVE, { label = kid })
+  if not ok then return nil, tostring(err) end
+  derived[kid] = true
+  return kid
+end
+
+-- NO sign() OR mac() HERE, and the absence is deliberate. Both work -- these
+-- exact calls, measured against drt 0.7.0-rc.1 with the grant this
+-- deployment now carries:
+--
+--   host.call('crypto/jwt_sign', { claims = c, ttl = n, key = 'fetchpoint:7' })
+--     -> a JWT whose header is {"alg":"HS256","typ":"JWT","kid":"fetchpoint:7"}
+--   host.call('crypto/hmac', { data = d, key = 'fetchpoint:7' })
+--     -> hex, and a different hex per label
+--   host.call('crypto/derive', { label = 'seat:9' })
+--     -> refused, naming the patterns the grant allows
+--
+-- -- but nothing in the API issues a token yet (§6.2 is the section that
+-- will), and a wrapper no caller has ever reached is a wrapper the battery
+-- cannot assert and the first consumer discovers is wrong. They arrive with
+-- that consumer, three lines from the notes above.
+
+return M

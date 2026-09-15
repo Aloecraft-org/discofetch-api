@@ -423,6 +423,329 @@ local MIGRATIONS = {
       [[SELECT entry_ttl, room_lifetime FROM fetchpoint LIMIT 0]],
     },
   },
+  {
+    -- ── migration 011: the Rooms spec's object model ────────────────────
+    -- doc/ROOMS-SPEC.md Appendix A. Draft 4 was pasted into conversation for
+    -- days and committed on 15 Sep; doc/ROOMS-GAP.md counted what was
+    -- missing (11 of 15 tables) and this closes it.
+    --
+    -- IT IS A SIMPLIFICATION, not a growth. `kind` + config_fields +
+    -- validate_config -- 283 lines that dispatch on a category -- are
+    -- replaced by SERVICE's five columns, which describe what a thing DOES
+    -- rather than what it is called. Endpoints stop being a parallel notion
+    -- and become what a service fronts; observations stop being endpoint
+    -- rows with provenance glued on.
+    --
+    -- WHAT MUST SURVIVE, and it is a short list: api_token (one account's,
+    -- and the ns_puller / mail_puller tokens ride on it) and the reflect
+    -- canary's fetchpoint. Observations are ephemeral by definition, no
+    -- invite is outstanding, and no peer or seat exists to migrate because
+    -- room membership has only ever been a Lua table in process memory.
+    -- So this migration ADDS and never rewrites: nothing here drops a
+    -- column, and every existing row keeps answering.
+    version = 11,
+    statements = {
+      -- ── the room becomes the spec's room (§4.1, §4.3) ────────────────
+      -- `topic` is the change that matters: §4.1 says a room has a topic,
+      -- not a name -- the DNS label part, unique per fetchpoint. Without it
+      -- every <fetchpoint>--<topic>--<verb> name in §9 is unreachable and a
+      -- room is addressable only by shortcode.
+      --
+      -- `access` STAYS beside `join_policy` because they are different
+      -- axes: access is the door's credential (anyone/code/token) and
+      -- join_policy is approval (open/request). §4.3 wants both, and
+      -- wg_rendezvous.dlua on machines we do not own reads the first.
+      [[ALTER TABLE room ADD COLUMN topic TEXT]],
+      [[ALTER TABLE room ADD COLUMN join_policy TEXT NOT NULL DEFAULT 'open']],
+      [[ALTER TABLE room ADD COLUMN ordering TEXT NOT NULL DEFAULT 'fifo']],
+      [[ALTER TABLE room ADD COLUMN locked INTEGER NOT NULL DEFAULT 0]],
+      [[ALTER TABLE room ADD COLUMN disclose_liveness TEXT NOT NULL DEFAULT 'shared']],
+      [[ALTER TABLE room ADD COLUMN disclose_capability TEXT NOT NULL DEFAULT 'shared']],
+      [[ALTER TABLE room ADD COLUMN ip_policy TEXT NOT NULL DEFAULT 'ignore']],
+      [[ALTER TABLE room ADD COLUMN permissions TEXT]],
+      [[ALTER TABLE room ADD COLUMN udp_port INTEGER]],
+      -- Unique per fetchpoint, like shortcode. NULLs are distinct in SQLite,
+      -- so rooms without a topic do not collide with each other.
+      [[CREATE UNIQUE INDEX IF NOT EXISTS room_topic ON room(fetchpoint_id, topic)]],
+
+      -- §1.1 and §3: the two fetchpoint-level columns the spec names.
+      [[ALTER TABLE fetchpoint ADD COLUMN display_names INTEGER NOT NULL DEFAULT 0]],
+      [[ALTER TABLE fetchpoint ADD COLUMN peer_capacity INTEGER]],
+
+      -- ── peer (§3) ────────────────────────────────────────────────────
+      -- A device known to a FETCHPOINT, not to a room -- identity is per
+      -- fetchpoint and a peer may sit in several rooms. `name` is ASSERTED:
+      -- identity cannot be observed, and the column says so because the
+      -- distinction is the whole of §3's first paragraph.
+      --
+      -- durability follows WHY the peer exists, not how long it has been
+      -- around: a device someone added is durable, one that appeared by
+      -- joining is ephemeral and expires. Peer capacity counts the durable.
+      [[CREATE TABLE IF NOT EXISTS peer (
+          id             INTEGER PRIMARY KEY,
+          fetchpoint_id  INTEGER NOT NULL,
+          account_id     INTEGER,
+          name           TEXT,
+          ufrag          TEXT,
+          pwd            TEXT,
+          durability     TEXT    NOT NULL DEFAULT 'ephemeral',
+          expires_at     INTEGER,
+          at             INTEGER NOT NULL
+        ) STRICT]],
+      [[CREATE INDEX IF NOT EXISTS peer_by_fp ON peer(fetchpoint_id)]],
+      [[CREATE INDEX IF NOT EXISTS peer_by_account ON peer(account_id)]],
+
+      -- ── seat (§4.2) ──────────────────────────────────────────────────
+      -- A POSITION in a room, occupied by a peer or empty. An empty seat is
+      -- how you pre-provision -- §13's phone-by-QR reads `pubkey` and
+      -- `requested_ips` off one before the phone has ever spoken.
+      --
+      -- `ordinal` is position and never an address: sparse, spaced by 2^24
+      -- so an insertion between two seats needs no rewrite, rescaled when
+      -- the gaps run out. Calling it an address is the mistake §4.2 exists
+      -- to prevent, and 4.4 says the WireGuard subnet is not linked to it.
+      [[CREATE TABLE IF NOT EXISTS seat (
+          id             INTEGER PRIMARY KEY,
+          room_id        TEXT    NOT NULL,
+          peer_id        INTEGER,
+          ordinal        INTEGER NOT NULL,
+          pinned         INTEGER NOT NULL DEFAULT 0,
+          role           TEXT,
+          pubkey         TEXT,
+          requested_ips  TEXT,
+          at             INTEGER NOT NULL
+        ) STRICT]],
+      [[CREATE INDEX IF NOT EXISTS seat_by_room ON seat(room_id, ordinal)]],
+      [[CREATE INDEX IF NOT EXISTS seat_by_peer ON seat(peer_id)]],
+
+      -- ── service (§5) ─────────────────────────────────────────────────
+      -- The table that replaces `kind`. Five columns say what a thing does
+      -- -- verb, call, transport, effect, lifespan -- and there is NO type
+      -- column by decision (§5.1): grouping is `effect`, and any finer
+      -- family is a txt key such as family=ssh.
+      --
+      -- peer_id NULL is a service the ROOM pins rather than a peer
+      -- advertises. lifespan='parked' is residency and, per §2.2, a node:
+      -- the row is the record of it, and the node is the socket.
+      [[CREATE TABLE IF NOT EXISTS service (
+          id             INTEGER PRIMARY KEY,
+          room_id        TEXT    NOT NULL,
+          peer_id        INTEGER,
+          endpoint_id    INTEGER,
+          verb           TEXT    NOT NULL,
+          call           TEXT,
+          transport      TEXT,
+          effect         TEXT,
+          lifespan       TEXT    NOT NULL DEFAULT 'pinned',
+          expires_at     INTEGER,
+          connect_hook   TEXT,
+          match_hook     TEXT,
+          pubkey         TEXT,
+          service_cidr   TEXT,
+          peer_ip        TEXT,
+          forwarding     INTEGER NOT NULL DEFAULT 0,
+          txt            TEXT,
+          at             INTEGER NOT NULL
+        ) STRICT]],
+      [[CREATE INDEX IF NOT EXISTS service_by_room ON service(room_id, verb)]],
+      [[CREATE INDEX IF NOT EXISTS service_by_peer ON service(peer_id)]],
+
+      -- ── endpoint (§2.1, §5) ──────────────────────────────────────────
+      -- An address. Fetchpoint-level, and ALWAYS reached behind a service:
+      -- that rule is what stops an endpoint being a second way to address a
+      -- thing, which is what the old model had.
+      [[CREATE TABLE IF NOT EXISTS endpoint (
+          id             INTEGER PRIMARY KEY,
+          fetchpoint_id  INTEGER NOT NULL,
+          kind           TEXT    NOT NULL,
+          value          TEXT    NOT NULL,
+          port           INTEGER
+        ) STRICT]],
+      [[CREATE INDEX IF NOT EXISTS endpoint_by_fp ON endpoint(fetchpoint_id)]],
+
+      -- ── observation (§3 liveness) ────────────────────────────────────
+      -- What a room has SEEN about an endpoint, service or peer. This is
+      -- where provenance lives -- `source` observed or asserted -- so the
+      -- thing observed does not have to carry it.
+      --
+      -- Ephemeral by definition, which is why nothing migrates into it: the
+      -- endpoint typing added by c166c77 lives in a Lua table today and is
+      -- lost on every restart. `last_seen` is liveness and §3 says render
+      -- it with age, never as a bare boolean.
+      [[CREATE TABLE IF NOT EXISTS observation (
+          id             INTEGER PRIMARY KEY,
+          room_id        TEXT    NOT NULL,
+          of_kind        TEXT    NOT NULL,
+          of_id          INTEGER NOT NULL,
+          kind           TEXT    NOT NULL,
+          source         TEXT    NOT NULL,
+          integrity      INTEGER NOT NULL DEFAULT 0,
+          reported       TEXT,
+          rtt_ms         INTEGER,
+          first_seen     INTEGER NOT NULL,
+          last_seen      INTEGER NOT NULL
+        ) STRICT]],
+      [[CREATE UNIQUE INDEX IF NOT EXISTS observation_one
+          ON observation(room_id, of_kind, of_id, kind, source)]],
+
+      -- ── template, grant, redemption (§6.3) ───────────────────────────
+      -- The reusable definition, the issued instance, and who took it.
+      -- Nothing migrates: no invite is outstanding. The existing `invite`
+      -- table stays untouched and keeps answering -- it merges what this
+      -- splits, and retiring it is a later decision made on evidence.
+      --
+      -- A grant may carry real authorization (token_id) or be nothing more
+      -- than a link, like a Discord invite. Both are tracked the same way,
+      -- which is what makes one mechanism cover a meet invite, a join
+      -- request and an account invite.
+      [[CREATE TABLE IF NOT EXISTS template (
+          id             INTEGER PRIMARY KEY,
+          fetchpoint_id  INTEGER NOT NULL,
+          kind           TEXT    NOT NULL,
+          for_kind       TEXT,
+          for_id         INTEGER,
+          text           TEXT,
+          card_html      TEXT,
+          default_ttl    INTEGER,
+          max_uses       INTEGER,
+          at             INTEGER NOT NULL
+        ) STRICT]],
+      [[CREATE INDEX IF NOT EXISTS template_by_fp ON template(fetchpoint_id)]],
+      [[CREATE TABLE IF NOT EXISTS grant (
+          id             INTEGER PRIMARY KEY,
+          template_id    INTEGER NOT NULL,
+          code           TEXT    NOT NULL UNIQUE,
+          recipient      TEXT,
+          token_id       INTEGER,
+          payload        TEXT,
+          expires_at     INTEGER,
+          revoked_at     INTEGER,
+          at             INTEGER NOT NULL
+        ) STRICT]],
+      [[CREATE TABLE IF NOT EXISTS redemption (
+          id             INTEGER PRIMARY KEY,
+          grant_id       INTEGER NOT NULL,
+          by_kind        TEXT    NOT NULL,
+          by_id          INTEGER NOT NULL,
+          result_kind    TEXT,
+          result_id      INTEGER,
+          at             INTEGER NOT NULL
+        ) STRICT]],
+      [[CREATE INDEX IF NOT EXISTS redemption_by_grant ON redemption(grant_id)]],
+
+      -- ── token (§6.2) ─────────────────────────────────────────────────
+      -- NOT api_token, and api_token is NOT TOUCHED. That table holds one
+      -- account's live credentials -- ns_puller and mail_puller among them
+      -- -- and breaking it breaks the fleet. This is the spec's polymorphic
+      -- token: issuer x scope, which api_token's account/fetchpoint pair
+      -- cannot express. The two coexist until something needs them not to.
+      [[CREATE TABLE IF NOT EXISTS room_token (
+          id             INTEGER PRIMARY KEY,
+          issuer_kind    TEXT    NOT NULL,
+          issuer_id      INTEGER NOT NULL,
+          scope_kind     TEXT    NOT NULL,
+          scope_id       INTEGER NOT NULL,
+          prefix         TEXT,
+          hash           TEXT    NOT NULL UNIQUE,
+          single_use     INTEGER NOT NULL DEFAULT 0,
+          expires_at     INTEGER,
+          revoked_at     INTEGER,
+          at             INTEGER NOT NULL
+        ) STRICT]],
+      [[CREATE INDEX IF NOT EXISTS room_token_by_scope
+          ON room_token(scope_kind, scope_id)]],
+
+      -- ── keypair (§6.1) ───────────────────────────────────────────────
+      -- Any entity may hold one. `private` is NULL when the key is derived
+      -- (room keys are HKDF(fetchpoint_secret, room_id), memory-only and
+      -- stable across hibernation) or held only in a node -- so a NULL here
+      -- is a statement, not a missing value.
+      --
+      -- Generated on fetchpoint create from the start. That is nearly free
+      -- now and is the difference between a trust root existing when
+      -- something needs it and a migration later. df/keys.dlua is the
+      -- writer; migration 012 renames `pubkey` here to `kid`, which is what
+      -- it turned out to hold.
+      [[CREATE TABLE IF NOT EXISTS keypair (
+          id             INTEGER PRIMARY KEY,
+          entity_kind    TEXT    NOT NULL,
+          entity_id      INTEGER NOT NULL,
+          pubkey         TEXT    NOT NULL UNIQUE,
+          private        TEXT,
+          created_at     INTEGER NOT NULL,
+          rotated_at     INTEGER
+        ) STRICT]],
+      [[CREATE UNIQUE INDEX IF NOT EXISTS keypair_one
+          ON keypair(entity_kind, entity_id)]],
+
+      -- ── sanction (§0), usage (§11) ───────────────────────────────────
+      -- Both are tables the spec names and neither has a consumer yet.
+      -- They are here because adding a table to a live database later is a
+      -- migration and adding it now is a line, and because `usage` is what
+      -- §11's metering writes to and that was already planned.
+      [[CREATE TABLE IF NOT EXISTS sanction (
+          id             INTEGER PRIMARY KEY,
+          scope_kind     TEXT    NOT NULL,
+          scope_id       INTEGER NOT NULL,
+          restricts_kind TEXT    NOT NULL,
+          restricts_id   INTEGER NOT NULL,
+          kind           TEXT    NOT NULL,
+          reason         TEXT,
+          at             INTEGER NOT NULL,
+          expires_at     INTEGER
+        ) STRICT]],
+      [[CREATE INDEX IF NOT EXISTS sanction_by_scope
+          ON sanction(scope_kind, scope_id)]],
+      [[CREATE TABLE IF NOT EXISTS usage (
+          id             INTEGER PRIMARY KEY,
+          fetchpoint_id  INTEGER NOT NULL,
+          room_id        TEXT,
+          meter          TEXT    NOT NULL,
+          value          INTEGER NOT NULL DEFAULT 0,
+          period_start   INTEGER NOT NULL
+        ) STRICT]],
+      -- COALESCE, not the bare column. SQLite treats NULLs as DISTINCT in a
+      -- unique index, which is exactly what `room` wants for shortcode and
+      -- topic -- two rooms without a code do not collide -- and exactly
+      -- wrong here: a fetchpoint-level meter has room_id NULL, so the bare
+      -- index lets the same (fetchpoint, meter, period) insert twice and
+      -- the counter silently doubles. Measured: two inserts, two rows.
+      [[CREATE UNIQUE INDEX IF NOT EXISTS usage_one
+          ON usage(fetchpoint_id, COALESCE(room_id, ''), meter, period_start)]],
+    },
+  },
+  {
+    version = 12,
+    statements = {
+      -- ── keypair holds a NAME, not a public key (§6.1) ─────────────────
+      -- 011 gave keypair a `pubkey TEXT NOT NULL UNIQUE`, on the assumption
+      -- that an entity's key has a public half. Measured against drt
+      -- 0.7.0-rc.1, it does not: the crypto connector offers `crypto/derive`,
+      -- which registers a key under a LABEL inside the connector and returns
+      -- nothing, and `crypto/jwt_sign` then takes `key = '<label>'` and puts
+      -- that label in the token's `kid` header. HS256 -- symmetric. There is
+      -- no public half to store, and a column named pubkey holding the
+      -- label's name would be a lie in the schema.
+      --
+      -- So the column is renamed to what it holds. `kid` is not an
+      -- abbreviation we invented: it is the JWT header field the host
+      -- already writes, so a verifier reading a token and a reader of this
+      -- table are looking at the same string.
+      --
+      -- Safe as a rename rather than a rebuild because the table has never
+      -- had a writer -- 011 created it empty and shipped, and nothing has
+      -- inserted a row on any deployment since.
+      { soft = [[ALTER TABLE keypair RENAME COLUMN pubkey TO kid]] },
+      -- And a real public key, for the day a host capability makes one.
+      -- Nullable, because today every row is a derived symmetric key and
+      -- NULL is the true answer rather than a missing one.
+      { soft = [[ALTER TABLE keypair ADD COLUMN pubkey TEXT]] },
+      -- The hard half, per the runner's rule: a soft ALTER that failed
+      -- because the table was missing is skipped as silently as one that
+      -- failed because it was already applied.
+      [[SELECT kid, pubkey, private FROM keypair LIMIT 0]],
+    },
+  },
 
 }
 
@@ -740,6 +1063,55 @@ end
 -- rooms and fetchpoint no longer have a require block of their own here --
 -- their sections moved into df/api.dlua -- but supervisor still owns
 -- init()ing every module, so the context is published in exactly one place.
+-- df/keys is init()ed HERE and bound to nothing, for the reason the comment
+-- above gives: supervisor owns init()ing every module so the context is
+-- published in one place, and df/api.dlua is the only caller. require caches,
+-- so the table api.dlua asks for is this one, already holding the context. A
+-- module init()ed nowhere reads a nil context at its first call -- which
+-- would surface as a crash inside a create, not here.
+require('df.keys').init(CTX)
+
+-- ROOMS-SPEC §6.1, for the names that already exist. The create path derives
+-- a key for every fetchpoint made from now on; migration 012 cannot do the
+-- same for the ones already in the table, because deriving is a hostcall and
+-- a migration is SQL. So it happens here, once a boot, and finds nothing on
+-- every boot after the first.
+--
+-- Bounded by construction: one hostcall and one insert per fetchpoint that
+-- has no key, and after this run there are none. The LIMIT is the connector's
+-- max_result_rows, not a page -- a deployment with more names than that gets
+-- the rest on the next boot rather than a refused query, which is the right
+-- trade for a backfill nothing is waiting on.
+--
+-- Its OWN pcall, for the reason trim_events has one: a fetchpoint without a
+-- key is a fetchpoint that cannot sign yet. A deployment that answers 503 on
+-- every endpoint because a key would not derive is a far worse outage than
+-- the thing it was protecting.
+local function backfill_keys()
+  local KEYS = require('df.keys')
+  local rows = rows_by_name(db.query(
+    [[SELECT f.id AS id FROM fetchpoint f
+       WHERE f.deleted_at IS NULL
+         AND NOT EXISTS (SELECT 1 FROM keypair k
+                          WHERE k.entity_kind = 'fetchpoint' AND k.entity_id = f.id)
+       LIMIT 256]]))
+  local made, t = 0, now()
+  for _, r in ipairs(rows) do
+    local kid = KEYS.ensure('fetchpoint', r.id)
+    if kid then
+      db.exec([[INSERT INTO keypair (entity_kind, entity_id, kid, created_at)
+                VALUES ('fetchpoint', ?, ?, ?)]], r.id, kid, t)
+      made = made + 1
+    end
+  end
+  if #rows > 0 then
+    print('keys: ' .. made .. ' of ' .. #rows .. ' fetchpoint keys derived')
+  end
+end
+if db_ready then
+  local okk, kerr = pcall(backfill_keys)
+  if not okk then print('key backfill: ' .. tostring(kerr)) end
+end
 local ROO = require('df.rooms')
 ROO.init(CTX)
 local FP = require('df.fetchpoint')
@@ -811,11 +1183,14 @@ while true do
     -- nothing upstream verifies it, so it SELECTS a FetchPoint and confers
     -- nothing. Every authority question inside a FetchPoint is answered by
     -- its own config and its own tokens, never by the name used to arrive.
-    local fp_label, fp_verb = fetchpoint_host(req.host)
+    -- Three parts now (ROOMS-SPEC §9). fp_topic is nil for every host shape
+    -- that existed before, so a deployed wg.sh calling <label>--join reaches
+    -- exactly the handler it always did.
+    local fp_label, fp_verb, fp_topic = fetchpoint_host(req.host)
     if fp_label then
       -- Under pcall for the same reason handlers are: a bug serving one
       -- FetchPoint answers 500 to that request, never takes the API down.
-      local okp, perr = pcall(serve_fetchpoint, m.conn, req, fp_label, fp_verb)
+      local okp, perr = pcall(serve_fetchpoint, m.conn, req, fp_label, fp_verb, fp_topic)
       if not okp then
         print('fetchpoint error: ' .. tostring(req.host) .. ': ' .. tostring(perr))
         fail(m.conn, 500, 'internal_error', 'the request failed; the reason is in the log')

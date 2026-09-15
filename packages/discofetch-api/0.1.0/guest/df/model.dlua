@@ -299,6 +299,83 @@ DIM.VERBS = {
                does = 'observe the caller and write it (use --identify)' },
   outcome  = { needs = 'rooms',    superseded_by = 'membership.reported',
                does = 'report how a punch went (becoming a membership field)' },
+
+  -- ── ROOMS-SPEC §7, registered now and mostly stubbed ─────────────────
+  -- REGISTERED FROM THE START, on purpose. A verb the name does not answer
+  -- at all is a 404, and a 404 is indistinguishable from a typo, a bad
+  -- deploy and a name that never existed. A verb that answers 501 NAMING ITS
+  -- SPEC SECTION is a promise with an address: whoever finds it knows the
+  -- shape is decided and the body is not.
+  --
+  -- It also settles the URL surface in one move. §9's three host shapes have
+  -- to recognise every verb before any of them works, and doing that
+  -- verb-by-verb as each is implemented means the name space changes shape
+  -- twenty times in front of whoever is building against it.
+  --
+  -- `stub` names the section rather than saying "todo": the section is where
+  -- the answer is, and a stub that cannot tell you where to read is just an
+  -- apology. Unstub by deleting the key and writing the branch.
+  --
+  -- `mutates` is §7's other rule -- read verbs answer over DNS subject to
+  -- visibility, mutating verbs are HTTPS only. Recorded here because the DNS
+  -- path is a different consumer (deploy/gates/ns) and it needs one place to
+  -- ask; nothing in THIS file enforces it, and saying so is cheaper than a
+  -- reader assuming it does.
+
+  -- meet
+  advertise = { needs = nil,     stub = '§5.1', mutates = true,
+                does = 'post an endpoint; record effect, ttl or parked' },
+  park      = { needs = 'rooms', stub = '§5.3', mutates = true,
+                does = 'take up residency behind a service (becomes a node)' },
+  mint      = { needs = nil,     stub = '§6.3', mutates = true,
+                does = 'issue a scoped token' },
+  invite    = { needs = nil,     stub = '§6.3', mutates = true,
+                does = 'issue a grant from a template' },
+  accept    = { needs = nil,     stub = '§6.3', mutates = true,
+                does = 'redeem a grant' },
+  decline   = { needs = nil,     stub = '§6.3', mutates = true,
+                does = 'refuse a grant, recording the refusal' },
+  promote   = { needs = 'rooms', stub = '§4.2', mutates = true,
+                does = 'move a seat up the ordinal' },
+  demote    = { needs = 'rooms', stub = '§4.2', mutates = true,
+                does = 'move a seat down the ordinal' },
+  pin       = { needs = 'rooms', stub = '§4.2', mutates = true,
+                does = 'pin a seat so match finds it first' },
+  -- HOOKS, not handlers (§5.2). They are named here so the host shape
+  -- recognises them and so `list` can report them; what they do is a dlua
+  -- function on the SERVICE, with a default, not a branch in this file.
+  connect   = { needs = 'rooms', stub = '§5.2 (hook)', mutates = false,
+                does = 'the service decides: an address, or a candidate trade' },
+  match     = { needs = 'rooms', stub = '§5.2 (hook)', mutates = false,
+                does = 'the selector in a crowded room; default pin then ordinal' },
+
+  -- peers
+  list      = { needs = nil,     stub = '§7', mutates = false,
+                does = 'what is here, subject to visibility' },
+  flag      = { needs = nil,     stub = '§0 sanction', mutates = true,
+                does = 'mark a peer without removing it' },
+  ban       = { needs = nil,     stub = '§0 sanction', mutates = true,
+                does = 'refuse a peer at the fetchpoint or the room' },
+  kick      = { needs = 'rooms', stub = '§7', mutates = true,
+                does = 'vacate a seat without banning its peer' },
+
+  -- visibility
+  show      = { needs = 'rooms', stub = '§4.3', mutates = true,
+                does = 'disclose this peer to the room' },
+  hide      = { needs = 'rooms', stub = '§4.3', mutates = true,
+                does = 'withdraw this peer from the room read' },
+
+  -- room
+  leave     = { needs = 'rooms', stub = '§7', mutates = true,
+                does = 'vacate a seat' },
+  request   = { needs = 'rooms', stub = '§4.3', mutates = true,
+                does = 'ask to join a room whose policy is request' },
+  lock      = { needs = 'rooms', stub = '§4.3', mutates = true,
+                does = 'refuse further joins' },
+  unlock    = { needs = 'rooms', stub = '§4.3', mutates = true,
+                does = 'allow joins again' },
+  info      = { needs = 'rooms', stub = '§7', mutates = false,
+                does = 'the room as a reader may see it' },
 }
 
 -- Verbs with no successor still answering. Empty today and kept because SS5.4
@@ -707,15 +784,64 @@ local function valid_name_label(s)
      and not s:match('%-$') and not s:find('--', 1, true)
 end
 
+-- ── the three host shapes (ROOMS-SPEC §9) ──────────────────────────────
+--
+--   <fetchpoint>.zone                      -> label
+--   <fetchpoint>--<verb>.zone              -> label, verb
+--   <fetchpoint>--<topic>--<verb>.zone     -> label, verb, topic
+--
+-- `--` is reserved and neither a topic nor a verb may contain one (§4.1), so
+-- splitting on it yields at most three parts and the shape is unambiguous by
+-- COUNT rather than by guessing what a part means.
+--
+-- ADDITIVE, and that word is load-bearing. wg.sh, wg_rendezvous.dlua and
+-- df-advertise.service are on machines we do not own and call
+-- <label>--join, --outcome and --dns. The two-part case returns EXACTLY what
+-- it returned before -- label and verb, topic nil -- so a router installed
+-- last month keeps answering. §5.4 is the rule and this is where it is kept.
+--
+-- FOUR parts or more is a refusal rather than a best effort: `a--b--c--d`
+-- has no meaning in §9, and a parser that picked one would invent a name
+-- somebody could then come to depend on.
+--
+-- NOT RESOLVED HERE, deliberately: `<fetchpoint>--<topic>` with no verb.
+-- §9 does not list it, and §5.1's `*` is the bare name of a FETCHPOINT. A
+-- two-part host is read as a verb, as it always was; if a room's bare name
+-- is wanted later it is a decision about precedence, not about parsing, and
+-- making it silently here would settle it by accident.
+local function valid_topic(s)
+  -- §4.1: the DNS label part. The '--' check is belt and braces -- the split
+  -- above cannot produce one -- and costs nothing beside being the sentence
+  -- the spec actually wrote.
+  return type(s) == 'string' and #s >= 1 and #s <= 63
+     and s:match('^[a-z0-9][a-z0-9%-]*$') ~= nil
+     and not s:match('%-$') and not s:find('--', 1, true)
+end
+
 local function fetchpoint_host(h)
   if type(h) ~= 'string' or h == '' then return nil end
   local candidate = h:match('^([^.]+)%.' .. C.ZONE:gsub('%.', '%%.') .. '$')
   if not candidate then return nil end
-  -- <base>--<verb>: the first '--' splits, and only the first can exist
-  -- because neither half may contain one.
-  local base, verb = candidate:match('^(.-)%-%-(.+)$')
-  if not base then base, verb = candidate, nil end
-  if LBL.valid_label(base) or valid_name_label(base) then return base, verb end
+
+  local parts = {}
+  local rest = candidate
+  while true do
+    local a, b = rest:match('^(.-)%-%-(.+)$')
+    if not a then parts[#parts + 1] = rest; break end
+    parts[#parts + 1] = a
+    rest = b
+    if #parts > 3 then return nil end
+  end
+
+  local base = parts[1]
+  if not (LBL.valid_label(base) or valid_name_label(base)) then return nil end
+
+  if #parts == 1 then return base, nil, nil end
+  if #parts == 2 then return base, parts[2], nil end          -- unchanged
+  if #parts == 3 then
+    if not valid_topic(parts[2]) then return nil end
+    return base, parts[3], parts[2]
+  end
   return nil
 end
 
@@ -729,5 +855,6 @@ M.same_config      = same_config
 M.fp_row           = fp_row
 M.fp_row_status    = fp_row_status
 M.fetchpoint_host  = fetchpoint_host
+M.valid_topic      = valid_topic
 
 return M

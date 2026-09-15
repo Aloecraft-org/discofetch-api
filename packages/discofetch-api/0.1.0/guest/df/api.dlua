@@ -40,6 +40,7 @@ local GRN  = require('df.grants')
 local IDN  = require('df.identity')
 local FP   = require('df.fetchpoint')
 local PP   = require('df.peer_program')
+local KEYS = require('df.keys')
 
 -- ── what the handlers below reach for ──────────────────────────────────
 -- One bind block, mirroring the one supervisor.lua used to carry, so every
@@ -81,7 +82,18 @@ local claim_label
 local PEER_NET       = '10.77.'   -- the tunnel /16; peers take .a.b inside it
 local PEER_MTU       = 1420       -- WireGuard's own default, minus nothing
 local PEER_PORT      = 51820      -- listen_port; the mapping is measured, not assumed
-local PEER_EXPOSE    = 22         -- what is reachable at this peer's tunnel address
+local PEER_EXPOSE    = 22         -- what is reachable at this peer's tunnel address; `none` for a pure client
+-- §5.1's vocabularies. Here with the route surface, not at first use, and
+-- not in model.dlua: they describe a SERVICE row's columns, and model.dlua
+-- is the fetchpoint's dimensions.
+-- §3: an ephemeral peer expires because of WHY it exists, so it needs a
+-- default lifetime. An hour is the room's own default lifetime, which keeps
+-- a device that joined and left from outliving the room it joined.
+local PEER_EPHEMERAL_TTL = 3600
+local SERVICE_EFFECTS    = { answer = true, redirect = true, route = true, record = true }
+local SERVICE_TRANSPORTS = { udp = true, tcp = true, wss = true, webrtc = true, wireguard = true }
+local SERVICE_LIFESPANS  = { pinned = true, ttl = true, parked = true }
+local PEER_FORWARD_MAX = 8        -- local ports reaching INTO the tunnel; a cap, so one request cannot render a config nobody can read
 local PEER_TIMEOUT_S = 600        -- how long to wait for somebody else in the room
 local PEER_STALE_S   = 300        -- a link silent this long is remapped
 local PEER_KEY_ENV   = 'WG_KEY'   -- the private key NEVER travels; the peer sets this
@@ -619,14 +631,38 @@ local function fetchpoints_create(req, p)
   C.db.exec('UPDATE label SET fetchpoint_id = ? WHERE label = ?',
           res and res.rowid or nil, label)
 
+  -- ROOMS-SPEC §6.1's trust root, made HERE rather than when something first
+  -- needs to sign. Deriving is a hostcall that returns nothing and writes one
+  -- row, so doing it at create costs a fetchpoint nothing measurable and
+  -- saves a backfill over every name that already exists on the day §6.2's
+  -- tokens land. `kid` is the name, not a secret: the key itself stays in the
+  -- crypto connector, which is what §6.1 means by "may exist only in memory
+  -- inside a node".
+  --
+  -- Best effort ON PURPOSE. A deployment whose config does not grant
+  -- host:crypto/derive is a real deployment -- fetch1 was one until the
+  -- release that added the scope -- and the right answer there is a
+  -- fetchpoint without a key, not a create that 500s over a capability the
+  -- caller can neither see nor fix. Nothing reads keypair yet, so the
+  -- difference is invisible until it isn't, and then it is one row.
+  local fp_id = res and res.rowid or nil
+  local kid, key_why = KEYS.ensure('fetchpoint', fp_id)
+  if kid then
+    C.db.exec([[INSERT INTO keypair (entity_kind, entity_id, kid, created_at)
+                VALUES ('fetchpoint', ?, ?, ?)]], fp_id, kid, t)
+  end
+
   -- After the durable write, never before it: an event describing a
   -- fetchpoint that does not exist is worse than no event at all.
   log_event('fetchpoint.create', acct.id, acct, {
     fetchpoint_id = res and res.rowid or nil, label = label,
     address = req.real_ip,
     -- Not `config`: a rendezvous point is born holding an advertise key,
-    -- and this row is readable by the owner and by audit.
-    detail = { name = name, kind = kind },
+    -- and this row is readable by the owner and by audit. `key_why` rides
+    -- here when there IS no key, because "why does this name have no trust
+    -- root" is otherwise answerable only by reading a log nobody keeps, and
+    -- the reason is a capability sentence rather than anything secret.
+    detail = { name = name, kind = kind, key_why = key_why },
   })
 
   local out = fp_row({ label = label, name = name, kind = kind,
@@ -636,6 +672,11 @@ local function fetchpoints_create(req, p)
   -- hands out a credential nobody asked for -- and inside a window that
   -- credential outlives the window.
   out.config = config_view(req, kind, config)
+  -- The kid, not the key. It is the string that will appear in the `kid`
+  -- header of every token this fetchpoint signs, so an owner verifying one
+  -- needs it; it confers nothing on whoever reads it. C.json.encode drops a
+  -- nil, so a deployment without the derive grant simply omits the field.
+  out.signing_key = kid
   return 201, out
 end
 
@@ -663,6 +704,14 @@ local function fetchpoints_get(req, p)
   local d, cfg = DIM.of(r)
   local out = fp_row(r, d)
   out.config = config_view(req, r.kind, cfg)
+  -- §6.1's trust root, read back by name. Only the owner's view carries it,
+  -- for the same reason only the owner's view carries config -- not because
+  -- the kid is a secret (it rides in the clear in every token it signs) but
+  -- because a public read answers what a VISITOR needs and this is not that.
+  local kp = C.rows_by_name(C.db.query(
+    [[SELECT kid FROM keypair
+       WHERE entity_kind = 'fetchpoint' AND entity_id = ? LIMIT 1]], r.id))[1]
+  if kp then out.signing_key = kp.kid end
   local adv = C.rows_by_name(C.db.query(
     'SELECT address, at FROM advertisement WHERE fetchpoint_id = ?', r.id))[1]
   -- `observed` is the new word and `advertised` the old; both for now. The
@@ -1132,6 +1181,308 @@ local function canon_pubkey(k)
   return nil
 end
 
+-- ── depth: the room's own objects (ROOMS-SPEC §4.2, §5.1) ──────────────
+-- One resolution for all of them, because there is one rule: the caller owns
+-- the fetchpoint, the fetchpoint carries rooms, and the room is claimed. The
+-- config endpoint did this inline first; a second copy would be a second
+-- place for the ownership check to drift out of.
+local function owned_room(req, p)
+  local acct, status, payload = resolve_account(req)
+  if not acct then return nil, status, payload end
+  local q = C.db.query([[SELECT id, label, kind, config, source, access, channel,
+                                behavior, subject, entry_ttl, room_lifetime
+                           FROM fetchpoint
+                          WHERE label = ? AND owner_account_id = ?
+                            AND deleted_at IS NULL LIMIT 1]], p.label, acct.id)
+  local r = C.rows_by_name(q)[1]
+  -- 404 and not 403 for somebody else's, as everywhere: a 403 confirms the
+  -- label exists, which is what a non-enumerable id is for.
+  if not r then
+    return nil, 404, { error = { code = 'not_found', message = 'no such fetchpoint' } }
+  end
+  local d = DIM.of(r)
+  if not d.rooms then
+    return nil, 409, { error = { code = 'rooms_disabled',
+      message = 'this fetchpoint does not carry rooms; PATCH rooms=true first' } }
+  end
+  local room = ROO.room_by_code(r.id, p.room, C.now())
+  if not room then
+    return nil, 404, { error = { code = 'no_such_room',
+      message = 'no open room with that code; claim one with --open first' } }
+  end
+  return { fp = r, room = room, acct = acct }
+end
+
+-- req.body is the RAW string; every handler in this file decodes it itself.
+-- Reading it as a table "works" -- b.anything is nil -- and produces a row
+-- with every optional field empty, which is indistinguishable from a caller
+-- who sent none. That is how the first seat here was created with no pubkey
+-- and looked like a success.
+local function json_body(req)
+  if not req.body or req.body == '' then return {} end
+  local ok, decoded = pcall(C.json.decode, req.body)
+  if not ok or type(decoded) ~= 'table' then return nil end
+  return decoded
+end
+
+-- A room claimed by its OWNER, with a name they chose. `--open` is the same
+-- claim reached by a machine holding the advertise key, and it takes no
+-- topic: a device opening a room has nobody to name it for. Two doors to one
+-- object, which is the pattern every verb here follows.
+-- ── peers (ROOMS-SPEC §3) ──────────────────────────────────────────────
+-- A device known to a FETCHPOINT, not to a room: identity is per fetchpoint
+-- and one peer may sit in several rooms. This is the row that room
+-- membership never was -- membership is presence, pruned at entry_ttl and
+-- gone on restart, so until now a device could not be named, banned, tied to
+-- an account, or given a seat that outlived it.
+--
+-- `name` is ASSERTED and the column says so. §3's first paragraph is that
+-- identity cannot be observed: everything else this API records about a peer
+-- is something an edge saw, and this is the one thing somebody claimed.
+local function peers_list(req, p)
+  local fp, status, payload = owned_fetchpoint(req, p)
+  if not fp then return status, payload end
+  return 200, { peers = C.rows_by_name(C.db.query(
+    [[SELECT id, account_id, name, durability, expires_at, at
+        FROM peer WHERE fetchpoint_id = ? ORDER BY at DESC LIMIT 256]],
+    fp.id)) }
+end
+
+local function peers_create(req, p)
+  local fp, status, payload = owned_fetchpoint(req, p)
+  if not fp then return status, payload end
+  local b = json_body(req)
+  if not b then
+    return 400, { error = { code = 'malformed_body',
+                            message = 'the body is not a JSON object' } }
+  end
+  if b.name ~= nil and (type(b.name) ~= 'string' or #b.name < 1 or #b.name > 64) then
+    return 400, { error = { code = 'invalid_value',
+      message = 'name is asserted, 1..64 characters -- identity is not observed' } }
+  end
+  -- §3: durability follows WHY the peer exists, not how long it has been
+  -- around. A device somebody added is durable; one that appeared by joining
+  -- is ephemeral and expires. This endpoint is somebody adding a device, so
+  -- durable is the default and the other is opt-in.
+  local dur = b.durability or 'durable'
+  if dur ~= 'durable' and dur ~= 'ephemeral' then
+    return 400, { error = { code = 'invalid_value',
+      message = 'durability is durable or ephemeral, and follows why the peer exists' } }
+  end
+  local expires
+  if dur == 'ephemeral' then
+    expires = C.now() + (tonumber(b.ttl) or PEER_EPHEMERAL_TTL)
+  end
+  -- §3 and §11: peer capacity counts DURABLE peers. An ephemeral one is a
+  -- device passing through and metering it would bill a visit.
+  local q = C.db.query([[SELECT peer_capacity FROM fetchpoint WHERE id = ?]], fp.id)
+  local cap = C.rows_by_name(q)[1]
+  cap = cap and cap.peer_capacity
+  if cap and dur == 'durable' then
+    local n = C.db.query([[SELECT COUNT(*) FROM peer
+                            WHERE fetchpoint_id = ? AND durability = 'durable']], fp.id)
+    n = (n.rows and n.rows[1] and n.rows[1][1]) or 0
+    if n >= cap then
+      return 409, { error = { code = 'peer_capacity',
+        message = 'this fetchpoint carries ' .. cap .. ' durable peers and has ' .. n } }
+    end
+  end
+  local t = C.now()
+  local res = C.db.try_exec([[INSERT INTO peer
+      (fetchpoint_id, account_id, name, ufrag, pwd, durability, expires_at, at)
+      VALUES (?,?,?,?,?,?,?,?)]],
+    fp.id, C.host.sql.NULL, b.name == nil and C.host.sql.NULL or b.name,
+    C.host.sql.NULL, C.host.sql.NULL, dur,
+    expires == nil and C.host.sql.NULL or expires, t)
+  if not res then
+    return 500, { error = { code = 'peer_not_created', message = 'the insert refused' } }
+  end
+  log_event('peer.create', fp.acct.id, fp.acct, {
+    fetchpoint_id = fp.id, address = req.real_ip,
+    detail = { peer_id = res.rowid, name = b.name, durability = dur },
+  })
+  return 201, { id = res.rowid, name = b.name, durability = dur,
+                expires_at = expires, at = t }
+end
+
+local function rooms_create(req, p)
+  local fp, status, payload = owned_fetchpoint(req, p)
+  if not fp then return status, payload end
+  local q = C.db.query([[SELECT id, label, kind, config, source, access, channel,
+                                behavior, subject, entry_ttl, room_lifetime
+                           FROM fetchpoint WHERE id = ? LIMIT 1]], fp.id)
+  local r = C.rows_by_name(q)[1]
+  local d, cfg = DIM.of(r)
+  -- `cfg.rooms`, NOT `d.rooms`, and the difference is the whole of this
+  -- comment. d.rooms means "this name answers room verbs" -- a legacy
+  -- system:rendezvous has it, because join/ice/outcome came with the kind.
+  -- cfg.rooms means "this name multiplexes NAMED rooms", which the join path
+  -- requires before it will look a room up by name at all.
+  --
+  -- Checking the wrong one created rooms nothing could ever join: 201 here,
+  -- then `rooms_disabled` from the join, on the same fetchpoint, in the same
+  -- minute. A create that succeeds into a state the reader cannot reach is
+  -- worse than a refusal, because the refusal is the thing that tells them
+  -- which field to set.
+  if cfg.rooms ~= true then
+    return 409, { error = { code = 'rooms_disabled',
+      message = 'this fetchpoint does not multiplex named rooms; PATCH '
+             .. 'rooms=true first, or claim an unnamed one with --open' } }
+  end
+  local b = json_body(req)
+  if not b then
+    return 400, { error = { code = 'malformed_body',
+                            message = 'the body is not a JSON object' } }
+  end
+  -- §4.1. Optional: a room with no topic is reachable by its shortcode and
+  -- is what `--open` produces, so requiring one here would make the two
+  -- doors produce different objects.
+  if b.topic ~= nil and not MDL.valid_topic(b.topic) then
+    return 400, { error = { code = 'invalid_value',
+      message = 'topic is the DNS label part: lower-case letters, digits and '
+             .. 'hyphens, 63 at most, no double hyphen (ROOMS-SPEC §4.1)' } }
+  end
+  local t = C.now()
+  local room, code, msg = ROO.room_claim(r.id, {
+    topic         = b.topic,
+    access        = d.access,
+    capacity      = cfg.room_capacity or 16,
+    entry_ttl     = d.entry_ttl or cfg.room_ttl or 300,
+    room_lifetime = d.room_lifetime or 3600,
+    visibility    = cfg.room_visibility or 'none',
+  }, t)
+  if not room then
+    -- A taken topic is the caller's problem to fix and a code collision is
+    -- ours, so they are different statuses: 409 is "choose another name",
+    -- 503 is "we could not draw one, try again".
+    return (code == 'topic_taken') and 409 or 503,
+           { error = { code = code, message = msg } }
+  end
+  log_event('room.create', fp.acct.id, fp.acct, {
+    fetchpoint_id = r.id, label = r.label, address = req.real_ip,
+    detail = { room = room.shortcode, topic = room.topic },
+  })
+  return 201, room
+end
+
+local function rooms_list(req, p)
+  local fp, status, payload = owned_fetchpoint(req, p)
+  if not fp then return status, payload end
+  return 200, { rooms = C.rows_by_name(C.db.query(
+    [[SELECT id, shortcode, topic, access, capacity, entry_ttl, room_lifetime,
+             visibility, created_at, expires_at
+        FROM room WHERE fetchpoint_id = ? ORDER BY created_at DESC LIMIT 256]],
+    fp.id)) }
+end
+
+local function seats_list(req, p)
+  local ctx, status, payload = owned_room(req, p)
+  if not ctx then return status, payload end
+  return 200, { room = ctx.room.shortcode, seats = ROO.seat_list(ctx.room.id) }
+end
+
+local function seats_create(req, p)
+  local ctx, status, payload = owned_room(req, p)
+  if not ctx then return status, payload end
+  local b = json_body(req)
+  if not b then
+    return 400, { error = { code = 'malformed_body',
+                            message = 'the body is not a JSON object' } }
+  end
+  -- EMPTY BY DEFAULT, and that is the feature. §4.2: an empty seat is how
+  -- you pre-provision, and §13's phone-by-QR reads `pubkey` and
+  -- `requested_ips` off one before the phone has ever spoken to us. A seat
+  -- that could only be created by someone joining would not carry that.
+  if b.pubkey ~= nil and (type(b.pubkey) ~= 'string' or #b.pubkey > 128) then
+    return 400, { error = { code = 'invalid_value',
+      message = 'pubkey claims this seat later; it is a key, not a name' } }
+  end
+  if b.requested_ips ~= nil and (type(b.requested_ips) ~= 'string' or #b.requested_ips > 256) then
+    return 400, { error = { code = 'invalid_value',
+      message = 'requested_ips is a comma list; the room\'s ip_policy decides (§4.4)' } }
+  end
+  if b.role ~= nil and (type(b.role) ~= 'string' or #b.role > 64) then
+    return 400, { error = { code = 'invalid_value', message = 'role is a label' } }
+  end
+  local cap = ctx.room.capacity
+  if cap then
+    local n = #ROO.seat_list(ctx.room.id)
+    if n >= cap then
+      return 409, { error = { code = 'room_full',
+        message = 'this room seats ' .. cap .. ' and has ' .. n } }
+    end
+  end
+  local seat = ROO.seat_create(ctx.room.id,
+    { pinned = b.pinned == true, role = b.role,
+      pubkey = b.pubkey, requested_ips = b.requested_ips }, C.now())
+  if not seat then
+    return 500, { error = { code = 'seat_not_created', message = 'the insert refused' } }
+  end
+  log_event('room.seat_create', ctx.acct.id, ctx.acct, {
+    fetchpoint_id = ctx.fp.id, label = ctx.fp.label, address = req.real_ip,
+    detail = { room = ctx.room.shortcode, ordinal = seat.ordinal },
+  })
+  return 201, seat
+end
+
+local function services_list(req, p)
+  local ctx, status, payload = owned_room(req, p)
+  if not ctx then return status, payload end
+  return 200, { room = ctx.room.shortcode, services = ROO.service_list(ctx.room.id) }
+end
+
+local function services_create(req, p)
+  local ctx, status, payload = owned_room(req, p)
+  if not ctx then return status, payload end
+  local b = json_body(req)
+  if not b then
+    return 400, { error = { code = 'malformed_body',
+                            message = 'the body is not a JSON object' } }
+  end
+  -- §5.1's five columns. There is no `type`: grouping is `effect`, and any
+  -- finer family is a txt key such as family=ssh. Validated against the
+  -- vocabularies rather than accepted as free text, because a service whose
+  -- effect nothing recognises is a row that can never be dispatched on.
+  if type(b.verb) ~= 'string' or b.verb == '' or #b.verb > 63 then
+    return 400, { error = { code = 'invalid_value',
+      message = 'verb is the label that triggers this service, or * for the bare name' } }
+  end
+  if b.effect ~= nil and not SERVICE_EFFECTS[b.effect] then
+    return 400, { error = { code = 'invalid_value',
+      message = 'effect is answer, redirect, route or record' } }
+  end
+  if b.transport ~= nil and not SERVICE_TRANSPORTS[b.transport] then
+    return 400, { error = { code = 'invalid_value',
+      message = 'transport is udp, tcp, wss, webrtc or wireguard' } }
+  end
+  if b.lifespan ~= nil and not SERVICE_LIFESPANS[b.lifespan] then
+    return 400, { error = { code = 'invalid_value',
+      message = 'lifespan is pinned, ttl or parked' } }
+  end
+  -- §2.2: a parked service IS a node -- the socket is the service and the
+  -- node's life is its life. Nothing here can create one, so saying so is
+  -- better than writing a row that claims residency nothing is holding.
+  if b.lifespan == 'parked' then
+    return 501, { error = { code = 'not_implemented',
+      message = 'a parked service is a node, not a row (ROOMS-SPEC §2.2); '
+             .. 'advertise creates one and that verb is still stubbed' } }
+  end
+  local svc = ROO.service_create(ctx.room.id, {
+    verb = b.verb, call = b.call, transport = b.transport, effect = b.effect,
+    lifespan = b.lifespan, pubkey = b.pubkey, service_cidr = b.service_cidr,
+    peer_ip = b.peer_ip, forwarding = b.forwarding == 1 or b.forwarding == true,
+    txt = b.txt, connect_hook = b.connect_hook, match_hook = b.match_hook,
+  }, C.now())
+  if not svc then
+    return 500, { error = { code = 'service_not_created', message = 'the insert refused' } }
+  end
+  log_event('room.service_create', ctx.acct.id, ctx.acct, {
+    fetchpoint_id = ctx.fp.id, label = ctx.fp.label, address = req.real_ip,
+    detail = { room = ctx.room.shortcode, verb = svc.verb, effect = svc.effect },
+  })
+  return 201, svc
+end
+
 local function rooms_config_get(req, p)
   local acct, status, payload = resolve_account(req)
   if not acct then return status, payload end
@@ -1175,13 +1526,74 @@ local function rooms_config_get(req, p)
              .. 'as `wg pubkey` prints it' } }
   end
 
+  -- The listen port is overridable because 51820 is the CONVENTION, not a
+  -- free port: a laptop that already runs WireGuard holds it, and every
+  -- config we hand that machine would collide on it -- `STUN I/O error:
+  -- Address in use`, before anything of ours gets a chance to say why.
+  -- Measured per port, so it has to be stable and it has to be theirs.
+  local port = PEER_PORT
+  if query.port and query.port ~= '' then
+    port = tonumber(query.port)
+    if not port or port ~= math.floor(port) or port < 1 or port > 65535 then
+      return 400, { error = { code = 'invalid_value',
+        message = 'port is the UDP port this peer listens on, 1..65535' } }
+    end
+  end
+
+  -- `expose` is what the tunnel can reach HERE; `forward` is what this
+  -- machine can reach THROUGH it. A config carrying only expose can be
+  -- reached and cannot reach, which is right for the box behind the NAT and
+  -- wrong for the laptop connecting to it -- ssh has to originate somewhere,
+  -- and without this the flagship journey stopped at "the peers met".
   local expose = PEER_EXPOSE
-  if query.expose and query.expose ~= '' then
+  if query.expose == 'none' then
+    expose = nil
+  elseif query.expose and query.expose ~= '' then
     expose = tonumber(query.expose)
     if not expose or expose ~= math.floor(expose) or expose < 1 or expose > 65535 then
       return 400, { error = { code = 'invalid_value',
-        message = 'expose is a port, 1..65535' } }
+        message = 'expose is a port, 1..65535, or none' } }
     end
+  end
+
+  -- LOCAL:ADDRESS:PORT, comma-separated, exactly the triple wg.sh's
+  -- --forward takes. The ADDRESS is the OTHER peer's tunnel address, which
+  -- this endpoint cannot know: it is derived from that peer's public key,
+  -- which is that peer's. You read it off their config, or off the room once
+  -- they have joined. Naming it here rather than resolving it keeps the
+  -- endpoint honest about what it has -- a config is issued before anybody
+  -- has joined anything.
+  local forwards = {}
+  if query.forward and query.forward ~= '' then
+    for spec in (query.forward .. ','):gmatch('([^,]*),') do
+      if spec ~= '' then
+        local lp, host, rp = spec:match('^(%d+):([%d%.]+):(%d+)$')
+        lp, rp = tonumber(lp or ''), tonumber(rp or '')
+        if not lp or not rp or not valid_ip(host or '')
+           or lp < 1 or lp > 65535 or rp < 1 or rp > 65535 then
+          return 400, { error = { code = 'invalid_value',
+            message = 'forward is LOCAL:ADDRESS:PORT -- the other peer\'s '
+                   .. 'tunnel address, as `wg.sh --forward` takes it; '
+                   .. 'separate several with commas' } }
+        end
+        if #forwards >= PEER_FORWARD_MAX then
+          return 400, { error = { code = 'invalid_value',
+            message = 'at most ' .. PEER_FORWARD_MAX .. ' forwards' } }
+        end
+        forwards[#forwards + 1] = { bind = '127.0.0.1:' .. lp,
+                                    to   = host .. ':' .. rp }
+      end
+    end
+  end
+
+  -- The runtime refuses a userspace stack that can neither reach nor be
+  -- reached, and it is right to: that is a device terminating traffic
+  -- nobody can hand it. Caught here so the message names the two knobs
+  -- rather than arriving from the config parser on the peer's machine.
+  if not expose and #forwards == 0 then
+    return 400, { error = { code = 'invalid_value',
+      message = 'expose=none needs at least one forward, or this config '
+             .. 'could neither reach nor be reached' } }
   end
 
   local addr, name = peer_ident(pubkey)
@@ -1220,13 +1632,17 @@ local function rooms_config_get(req, p)
       stale_s    = PEER_STALE_S,
     },
     wireguard = {
-      listen_port     = PEER_PORT,
+      listen_port     = port,
       -- userspace, always. The journey this serves is a person with no root
       -- on the box: kernel mode needs an adapter and CAP_NET_ADMIN, and a
       -- config we hand out cannot assume either.
       mode            = 'userspace',
-      expose          = { { tunnel = addr .. ':' .. expose,
-                            to     = '127.0.0.1:' .. expose } },
+      -- Absent, not empty: the runtime skips an omitted key and would read
+      -- an empty list as a deliberate "nothing", which is the same thing
+      -- here but says something different to a person reading the file.
+      expose          = expose and { { tunnel = addr .. ':' .. expose,
+                                       to     = '127.0.0.1:' .. expose } } or nil,
+      forward         = #forwards > 0 and forwards or nil,
       address         = addr .. '/32',
       mtu             = PEER_MTU,
       private_key_env = PEER_KEY_ENV,
@@ -3892,8 +4308,21 @@ local ROUTES = {
   -- The last mile: one runnable config for one peer in one room. Before
   -- the advertisement routes only because sub-resources go first and this
   -- is the deepest of them.
+  { 'GET',    '^/v1/fetchpoints/' .. SLUG .. '/peers$',   peers_list,   'label' },
+  { 'POST',   '^/v1/fetchpoints/' .. SLUG .. '/peers$',   peers_create, 'label' },
+  { 'GET',    '^/v1/fetchpoints/' .. SLUG .. '/rooms$',   rooms_list,   'label' },
+  { 'POST',   '^/v1/fetchpoints/' .. SLUG .. '/rooms$',   rooms_create, 'label' },
   { 'GET',    '^/v1/fetchpoints/' .. SLUG .. '/rooms/' .. SLUG .. '/config$',
                                                         rooms_config_get, 'label', 'room' },
+  -- The room's own objects. Collections before the item, as everywhere.
+  { 'GET',    '^/v1/fetchpoints/' .. SLUG .. '/rooms/' .. SLUG .. '/seats$',
+                                                        seats_list,    'label', 'room' },
+  { 'POST',   '^/v1/fetchpoints/' .. SLUG .. '/rooms/' .. SLUG .. '/seats$',
+                                                        seats_create,  'label', 'room' },
+  { 'GET',    '^/v1/fetchpoints/' .. SLUG .. '/rooms/' .. SLUG .. '/services$',
+                                                        services_list, 'label', 'room' },
+  { 'POST',   '^/v1/fetchpoints/' .. SLUG .. '/rooms/' .. SLUG .. '/services$',
+                                                        services_create, 'label', 'room' },
   { 'PUT',    '^/v1/fetchpoints/' .. SLUG .. '/advertisement$',  advertisement_put,    'label' },
   { 'DELETE', '^/v1/fetchpoints/' .. SLUG .. '/advertisement$',  advertisement_delete, 'label' },
   { 'GET',    '^/v1/fetchpoints/' .. SLUG .. '/traffic$',        fetchpoints_traffic,  'label' },

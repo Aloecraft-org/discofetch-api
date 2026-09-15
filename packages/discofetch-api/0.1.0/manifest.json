@@ -12,6 +12,7 @@
       "df.grants": "guest/df/grants.dlua",
       "df.http": "guest/df/http.dlua",
       "df.identity": "guest/df/identity.dlua",
+      "df.keys": "guest/df/keys.dlua",
       "df.label": "guest/df/label.dlua",
       "df.meter": "guest/df/meter.dlua",
       "df.model": "guest/df/model.dlua",

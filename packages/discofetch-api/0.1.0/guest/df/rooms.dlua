@@ -228,6 +228,32 @@ end
 -- available without transactions. The same loop claim_label runs, for the
 -- same reason: at these widths the retry is theatre against collision and
 -- real against two requests drawing in the same instant.
+-- The sql connector REFUSES a bare Lua nil as a bound parameter, and the
+-- refusal is the right call: `nil` in a vararg list is indistinguishable
+-- from an argument somebody forgot, so a typo would write NULL into a column
+-- and look deliberate. An intentional NULL is spelled.
+--
+-- Worth a helper rather than a sentinel at each call site: a seat is mostly
+-- nullable -- an EMPTY one has no peer, no role, no key -- and that is the
+-- common case, not the edge.
+local function nul(v) if v == nil then return C.host.sql.NULL end return v end
+
+-- §4.1: the topic is the DNS label part, unique per fetchpoint. Same
+-- expiry rule as a shortcode -- an expired row reads as absent, so a reaper
+-- running behind shrinks the live name space and never mis-resolves.
+local function room_by_topic(fp_id, topic, t)
+  if type(topic) ~= 'string' or topic == '' then return nil end
+  local q = C.db.query([[SELECT id, shortcode, topic, access, capacity, entry_ttl,
+                                room_lifetime, visibility, expires_at
+                           FROM room
+                          WHERE fetchpoint_id = ? AND topic = ? LIMIT 1]],
+    fp_id, topic)
+  local r = C.rows_by_name(q)[1]
+  if not r then return nil end
+  if r.expires_at and r.expires_at <= t then return nil end
+  return r
+end
+
 local function room_claim(fp_id, policy, t)
   local b32 = 'abcdefghijklmnopqrstuvwxyz234567'
   for _ = 1, CLAIM_ATTEMPTS do
@@ -242,16 +268,24 @@ local function room_claim(fp_id, policy, t)
     code = table.concat(code)
     local expires = policy.room_lifetime and (t + policy.room_lifetime) or nil
     local res = C.db.try_exec([[INSERT INTO room
-        (id, fetchpoint_id, shortcode, access, capacity, entry_ttl,
+        (id, fetchpoint_id, shortcode, topic, access, capacity, entry_ttl,
          room_lifetime, visibility, created_at, expires_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)]],
-      id, fp_id, code, policy.access, policy.capacity, policy.entry_ttl,
-      policy.room_lifetime, policy.visibility, t, expires)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)]],
+      id, fp_id, code, nul(policy.topic), policy.access, policy.capacity,
+      policy.entry_ttl, policy.room_lifetime, policy.visibility, t, expires)
     if res then
-      return { id = id, shortcode = code, access = policy.access,
+      return { id = id, shortcode = code, topic = policy.topic,
+               access = policy.access,
                capacity = policy.capacity, entry_ttl = policy.entry_ttl,
                room_lifetime = policy.room_lifetime,
                visibility = policy.visibility, expires_at = expires }
+    end
+    -- A taken TOPIC is not a code collision and retrying cannot help: the
+    -- shortcode is redrawn each pass, the topic is the caller's. Told apart
+    -- so the caller learns which of the two names they cannot have.
+    if policy.topic and room_by_topic(fp_id, policy.topic, t) then
+      return nil, 'topic_taken',
+             'this fetchpoint already has a room called ' .. policy.topic
     end
   end
   return nil, 'room_code_exhausted',
@@ -275,6 +309,76 @@ local function room_by_code(fp_id, code, t)
   return r
 end
 
+-- ── seats and services (ROOMS-SPEC §4.2, §5.1) ─────────────────────────
+-- Rows, unlike membership. ROOMS above is presence: a Lua table keyed by
+-- address#port, pruned at entry_ttl, gone on restart. A SEAT is a position
+-- that outlives whoever is sitting in it and can exist with nobody in it at
+-- all, which is the whole of §4.2 -- an empty seat is how you pre-provision,
+-- and §13's phone-by-QR reads a pubkey off one before the phone has spoken.
+--
+-- The two live side by side on purpose. Presence answers "who is here now",
+-- which a row cannot without a write per heartbeat; a seat answers "whose
+-- place is this", which memory cannot across a restart.
+
+-- §4.2: ordinal is POSITION, sparse, 2^24 apart so an insertion between two
+-- seats is a new number rather than a rewrite of every row after it. Never
+-- an address -- §4.4 says the WireGuard subnet is not linked to it, and
+-- calling it an address is the mistake the spacing exists to make obvious.
+local ORDINAL_STEP = 16777216   -- 2^24
+
+
+local function seat_create(room_id, f, t)
+  local q = C.db.query('SELECT MAX(ordinal) FROM seat WHERE room_id = ?', room_id)
+  local top = (q.rows and q.rows[1] and q.rows[1][1]) or 0
+  local ordinal = top + ORDINAL_STEP
+  local res = C.db.try_exec([[INSERT INTO seat
+      (room_id, peer_id, ordinal, pinned, role, pubkey, requested_ips, at)
+      VALUES (?,?,?,?,?,?,?,?)]],
+    room_id, nul(f.peer_id), ordinal, f.pinned and 1 or 0, nul(f.role),
+    nul(f.pubkey), nul(f.requested_ips), t)
+  if not res then return nil end
+  return { id = res.rowid, room_id = room_id, peer_id = f.peer_id,
+           ordinal = ordinal, pinned = f.pinned and 1 or 0, role = f.role,
+           pubkey = f.pubkey, requested_ips = f.requested_ips, at = t }
+end
+
+-- Pinned first, then ordinal: §5.2 says that is `match`'s default, and a
+-- list that ordered differently from the selector would be a second answer
+-- to the same question.
+local function seat_list(room_id)
+  return C.rows_by_name(C.db.query(
+    [[SELECT id, peer_id, ordinal, pinned, role, pubkey, requested_ips, at
+        FROM seat WHERE room_id = ? ORDER BY pinned DESC, ordinal LIMIT 256]],
+    room_id))
+end
+
+local function service_create(room_id, f, t)
+  local res = C.db.try_exec([[INSERT INTO service
+      (room_id, peer_id, endpoint_id, verb, call, transport, effect, lifespan,
+       expires_at, connect_hook, match_hook, pubkey, service_cidr, peer_ip,
+       forwarding, txt, at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)]],
+    room_id, nul(f.peer_id), nul(f.endpoint_id), f.verb, nul(f.call),
+    nul(f.transport), nul(f.effect), f.lifespan or 'pinned', nul(f.expires_at),
+    nul(f.connect_hook), nul(f.match_hook), nul(f.pubkey), nul(f.service_cidr),
+    nul(f.peer_ip), f.forwarding and 1 or 0, nul(f.txt), t)
+  if not res then return nil end
+  return { id = res.rowid, room_id = room_id, peer_id = f.peer_id,
+           verb = f.verb, call = f.call, transport = f.transport,
+           effect = f.effect, lifespan = f.lifespan or 'pinned',
+           pubkey = f.pubkey, service_cidr = f.service_cidr,
+           peer_ip = f.peer_ip, forwarding = f.forwarding and 1 or 0,
+           txt = f.txt, at = t }
+end
+
+local function service_list(room_id)
+  return C.rows_by_name(C.db.query(
+    [[SELECT id, peer_id, endpoint_id, verb, call, transport, effect,
+             lifespan, expires_at, pubkey, service_cidr, peer_ip, forwarding,
+             txt, at
+        FROM service WHERE room_id = ? ORDER BY id LIMIT 256]], room_id))
+end
+
 local function valid_room(name)
   return type(name) == 'string' and #name >= 1 and #name <= 64
      and name:match('^[%w%-_]+$') ~= nil
@@ -293,6 +397,12 @@ M.valid_room         = valid_room
 M.ENDPOINT_KINDS     = ENDPOINT_KINDS
 M.room_claim         = room_claim
 M.room_by_code       = room_by_code
+M.room_by_topic      = room_by_topic
 M.canon_code         = canon_code
+M.ORDINAL_STEP       = ORDINAL_STEP
+M.seat_create        = seat_create
+M.seat_list          = seat_list
+M.service_create     = service_create
+M.service_list       = service_list
 
 return M

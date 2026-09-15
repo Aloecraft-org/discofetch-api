@@ -7,7 +7,7 @@
 -- ====================================================== the surface block
 --
 -- Entry points:   M.init(ctx)
---                 M.serve_fetchpoint(conn, req, label, verb)
+--                 M.serve_fetchpoint(conn, req, label, verb, topic)
 --                 M.advertise(fp_id, addr, t)
 --
 -- The trust note that governs everything here: the Host header SELECTS a
@@ -135,7 +135,12 @@ local function reflect_answer(conn, req, label, d, cfg)
   }, ROO.PUBLIC_READ)
 end
 
-local function serve_fetchpoint(conn, req, label, verb)
+-- `topic` is the room in the HOST (ROOMS-SPEC §9's three-part shape) and is
+-- nil for every host that existed before this. Where a verb also takes a
+-- room in the path or the query, the host is the more specific statement and
+-- wins -- but nothing reads it yet, so today it only has to be carried
+-- without changing what the two-part shapes do.
+local function serve_fetchpoint(conn, req, label, verb, topic)
   -- Two room helpers scoped here rather than beside ROO.room_join: the main
   -- chunk is at Lua's 200-local limit (see C.ICE above), and nothing else
   -- uses them.
@@ -212,6 +217,8 @@ local function serve_fetchpoint(conn, req, label, verb)
   -- The dimensions decide the bare-name answer below; `kind` still gates the
   -- verbs and names the config registry, and both of those move next.
   local d, cfg = MDL.DIM.of(row)
+  local host_room
+
 
   if verb then
     -- The verb gate reads the ROW, not the kind. `kind.verbs` gating them is
@@ -228,6 +235,21 @@ local function serve_fetchpoint(conn, req, label, verb)
     local vspec = MDL.DIM.VERBS[verb]
     if not vspec then
       return HTTP.fail(conn, 404, 'no_verb', 'there is no verb ' .. verb)
+    end
+    -- REGISTERED, NOT BUILT. Before the `needs` gate on purpose: "we have not
+    -- written it" is true whatever this row is configured to do, and sending
+    -- somebody to PATCH rooms so they can reach a 501 is two round trips to
+    -- the same answer.
+    --
+    -- 501 rather than 404 because they are different facts. A 404 says the
+    -- name does not exist and is indistinguishable from a typo or a bad
+    -- deploy; this says the shape is decided, points at the section that
+    -- decided it, and is a promise with an address.
+    if vspec.stub then
+      return HTTP.fail(conn, 501, 'not_implemented',
+                  '--' .. verb .. ' ' .. (vspec.does or 'is specified')
+                    .. ' -- registered from ROOMS-SPEC ' .. vspec.stub
+                    .. ', not yet implemented')
     end
     -- What a name can DO follows from what it IS, and each refusal names the
     -- field to change rather than the kind to recreate.
@@ -249,6 +271,32 @@ local function serve_fetchpoint(conn, req, label, verb)
     elseif vspec.needs == 'relay_config' and d.serve_relay_config ~= true then
       return HTTP.fail(conn, 400, 'relay_config_disabled',
                   'this name does not hand out a relay list; PATCH serve_relay_config')
+    end
+
+    -- ── the host's topic, resolved (ROOMS-SPEC §4.1, §9) ────────────
+    -- AFTER the verb gate, ordered like the stub check above and for the
+    -- same reason: "no room called kitchen" and "nobody built --info" are
+    -- both true, and resolving the room first would send somebody to create
+    -- one so they could then discover the verb is not written. Two round
+    -- trips to one answer. The verb is a fact about US; the topic is a fact
+    -- about this fetchpoint.
+    --
+    -- <label>--<topic>--<verb> names a room in the HOST, which is the most
+    -- specific statement of which room this is -- more specific than a path
+    -- segment and far more than ?room=. So it wins, and the two sites below
+    -- read host_room before they read either.
+    --
+    -- A topic that resolves to nothing is a 404 HERE rather than a fall
+    -- through to the path: <label>--kitchen--join with no kitchen is a request
+    -- for a room that does not exist, and quietly serving whatever the path
+    -- said instead would put a peer in the wrong room and look like success.
+    if topic then
+      local rt = ROO.room_by_topic(row.id, topic, C.now())
+      if not rt then
+        return HTTP.fail(conn, 404, 'no_such_room',
+                    'this fetchpoint has no room called ' .. topic)
+      end
+      host_room = rt.shortcode
     end
 
     -- --reflect: the observation that WRITES NOTHING, on every name without
@@ -382,7 +430,7 @@ local function serve_fetchpoint(conn, req, label, verb)
       -- but wg_rendezvous.dlua is already in the field asking with ?room=,
       -- so both are read until its counter says otherwise -- the same SS5.4
       -- window the superseded verbs get.
-      local room = req.path and req.path:match('^/([^/?]+)') or ''
+      local room = host_room or (req.path and req.path:match('^/([^/?]+)')) or ''
       if room == '' then room = req.query.room or '' end
       if room == '' or not ROO.valid_room(room) then
         return HTTP.fail(conn, 400, 'bad_room',
@@ -489,7 +537,7 @@ local function serve_fetchpoint(conn, req, label, verb)
     -- learn which query words we reserved. ?room= is still read, and only
     -- second, because wg_rendezvous.dlua joins that way today and is fetched
     -- from the site at install time onto machines we cannot reach (§5.4).
-    local room = req.path and req.path:match('^/([^/?]+)') or ''
+    local room = host_room or (req.path and req.path:match('^/([^/?]+)')) or ''
     if room == '' then room = req.query.room or '' end
     -- CANONICALISE AT THE DOOR (§2.2): lowercase on the way in, so K7F2 and
     -- k7f2 are one room. A phone keyboard capitalises the first character of
