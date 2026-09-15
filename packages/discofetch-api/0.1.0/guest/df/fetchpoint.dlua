@@ -80,6 +80,61 @@ local function advertise(fp_id, addr, t)
   return t, changed
 end
 
+-- The reflect answer, lifted out of the bare-name path when --reflect
+-- stopped being a kind (SS5.1) and became a verb EVERY name carries.
+-- One function because the verb and a report/caller bare name must show
+-- the same observation: the only difference between --reflect and
+-- --identify is whether it also writes, and neither is a property of the
+-- name it is asked of.
+local function reflect_answer(conn, req, label, d, cfg)
+  local addr = HTTP.observed_address(req)
+
+  -- Text mode: the bare address and a newline, nothing else. This is
+  -- the shape a shell wants -- `ip=$(curl -s https://name/)` -- and
+  -- parsing JSON out of a router's busybox is not a thing to ask of
+  -- anyone. ?format= wins over the configured default in both
+  -- directions, so one name serves a script and a browser alike.
+  local fmt = req.query.format or d.report_format or 'json'
+  if fmt == 'text' then
+    -- No observation is an empty line rather than the word 'nil': the
+    -- consumer is a variable assignment, and an empty one is testable.
+    -- THIS CONTRACT IS FROZEN: the bare address and a newline, nothing
+    -- else, forever -- scripts assign it and it never grows.
+    return HTTP.reply(conn, 200, (addr or '') .. '\n', ROO.PUBLIC_READ, 'text/plain')
+  end
+
+  local prt = HTTP.observed_port(req)
+  if fmt == 'addr-port' then
+    -- ADDRESS PORT and a newline; an empty line when EITHER half is
+    -- unobserved. All-or-nothing on purpose: the consumer is the NAT
+    -- diagnostic parsing two tokens, and half an answer would be
+    -- indistinguishable from a wrong one.
+    local line = (addr and prt) and (addr .. ' ' .. prt) or ''
+    return HTTP.reply(conn, 200, line .. '\n', ROO.PUBLIC_READ, 'text/plain')
+  end
+
+  return HTTP.reply(conn, 200, {
+    service = 'reflect',
+    label = label,
+    observed = { address = addr, port = prt, edge = req.edge,
+                 forwarded = cfg.debug_forwarded and req.forwarded
+                   or HTTP.public_forwarded(req.forwarded) },
+    -- How to measure against this deployment (diluvium-drt #25 §1): the
+    -- STUN pair and the vantage addresses, both as netcheck's own flags
+    -- spell them. Only in the JSON form -- text and addr-port are
+    -- frozen contracts -- and on EVERY name that reports its caller,
+    -- because the measurement is the deployment's, not the canary's.
+    measure = { stun = C.ICE.STUN_HOSTS, vantages = C.ICE.VANTAGES },
+    request = { method = req.method, path = req.path,
+                query = next(req.query) and req.query or nil },
+    host = req.host,
+    -- Presence only, permanently: reflect echoes what the caller looks
+    -- like, and a credential is not a look.
+    authorization = req.authorization and 'present' or 'absent',
+    at = C.now(),
+  }, ROO.PUBLIC_READ)
+end
+
 local function serve_fetchpoint(conn, req, label, verb)
   -- Two room helpers scoped here rather than beside ROO.room_join: the main
   -- chunk is at Lua's 200-local limit (see C.ICE above), and nothing else
@@ -94,13 +149,36 @@ local function serve_fetchpoint(conn, req, label, verb)
   -- the same thing. A plain candidate encodes as it is. A peer carries an
   -- ARRAY of candidates, spliced in by hand: C.json.encode of an empty Lua
   -- table is an object, and a peer with no candidates yet must read as [].
+  -- ONE shape now, which is the §2.1 correction: every peer carries an
+  -- endpoints array whether or not it has a ufrag, so nothing branches on
+  -- whether one is present. The flat fields and `candidates` ride along for
+  -- the §5.4 window -- wg_rendezvous.dlua reads `address` off a peer and is
+  -- installed from the site onto machines we cannot reach.
+  --
+  -- Spliced by hand rather than encoded, for the reason the old encoder gave:
+  -- C.json.encode of an empty Lua table is an object, and a peer with no
+  -- endpoints must read as [].
   local function room_entry_json(c)
-    if not c.ufrag then return C.json.encode(c) end
-    local cj = {}
-    for i, cand in ipairs(c.candidates or {}) do cj[i] = C.json.encode(cand) end
-    local head = C.json.encode({ ufrag = c.ufrag, pwd = c.pwd, name = c.name, at = c.at,
-                               observed = c.observed, outcome = c.outcome })
-    return head:sub(1, -2) .. ',"candidates":[' .. table.concat(cj, ',') .. ']}'
+    local head = C.json.encode({
+      ufrag = c.ufrag, pwd = c.pwd, name = c.name, at = c.at,
+      observed = c.observed, outcome = c.outcome, rtt_ms = c.rtt_ms,
+      address = c.address, port = c.port, relay = c.relay,
+      wg_pubkey = c.wg_pubkey, wg_address = c.wg_address,
+    })
+    local eps = {}
+    for i, e in ipairs(c.endpoints or {}) do eps[i] = C.json.encode(e) end
+    -- `reported` is emitted even when empty. A peer that has not said how it
+    -- went is a different fact from a field that does not exist, and the
+    -- reader is counting the silences -- doc/NETCHECK.md cannot tell whether
+    -- the tree has been wrong twice without them.
+    local tail = ',"endpoints":[' .. table.concat(eps, ',') .. ']'
+      .. ',"reported":' .. (c.reported and C.json.encode(c.reported) or 'null')
+    if c.ufrag then
+      local cj = {}
+      for i, cand in ipairs(c.candidates or {}) do cj[i] = C.json.encode(cand) end
+      tail = tail .. ',"candidates":[' .. table.concat(cj, ',') .. ']'
+    end
+    return head:sub(1, -2) .. tail .. '}'
   end
 
   if not C.db_ready then
@@ -113,7 +191,7 @@ local function serve_fetchpoint(conn, req, label, verb)
   -- exercised, not who is calling.
   local q = C.db.query([[SELECT f.id AS id, f.label AS label, f.name AS name,
                               f.kind AS kind, f.config AS config,
-                              f.template AS template, f.source AS source, f.access AS access, f.channel AS channel, f.behavior AS behavior, f.subject AS subject, f.published_address AS published_address, f.published_locked AS published_locked, f.redirect_target AS redirect_target, f.redirect_status AS redirect_status, f.report_format AS report_format, f.serve_relay_config AS serve_relay_config,
+                              f.template AS template, f.source AS source, f.access AS access, f.channel AS channel, f.behavior AS behavior, f.subject AS subject, f.published_address AS published_address, f.published_locked AS published_locked, f.redirect_target AS redirect_target, f.redirect_status AS redirect_status, f.report_format AS report_format, f.serve_relay_config AS serve_relay_config, f.entry_ttl AS entry_ttl, f.room_lifetime AS room_lifetime,
                               f.created_at AS created_at, f.updated_at AS updated_at,
                               a.tier AS tier
                          FROM fetchpoint f
@@ -136,12 +214,89 @@ local function serve_fetchpoint(conn, req, label, verb)
   local d, cfg = MDL.DIM.of(row)
 
   if verb then
-    if not (kind and kind.verbs and kind.verbs[verb]) then
+    -- The verb gate reads the ROW, not the kind. `kind.verbs` gating them is
+    -- what made system:reflect a kind rather than a pair of dimensions, and
+    -- what kept --outcome behind the ice flag so the path this product ships
+    -- could never report itself. A retired verb answers with its
+    -- REPLACEMENT named: a 404 that only says no sends whoever built on it
+    -- last week to the docs to find out what happened.
+    local gone = MDL.DIM.RETIRED_VERBS[verb]
+    if gone then
       return HTTP.fail(conn, 404, 'no_verb',
-                  row.kind .. ' has no verb ' .. verb)
+                  '--' .. verb .. ' is retired; use ' .. gone)
+    end
+    local vspec = MDL.DIM.VERBS[verb]
+    if not vspec then
+      return HTTP.fail(conn, 404, 'no_verb', 'there is no verb ' .. verb)
+    end
+    -- What a name can DO follows from what it IS, and each refusal names the
+    -- field to change rather than the kind to recreate.
+    -- A LOCKED name still identifies, and that is the point of `held`: the
+    -- lock pins what readers get, it does not stop the name being observed.
+    -- The legacy mapping conflates the two -- an address_override sets
+    -- source=asserted -- so gating on source alone silently retires the
+    -- observation half of every pinned name, which is what run.sh caught as
+    -- "the held marker is missing". Only a name that is asserted AND not
+    -- merely pinned has nothing to write.
+    if vspec.needs == 'observed'
+       and d.source ~= 'observed' and not d.published_locked then
+      return HTTP.fail(conn, 400, 'not_observed',
+                  '--' .. verb .. ' writes an observation, and this name is '
+                    .. 'source=asserted: its address is set, never seen')
+    elseif vspec.needs == 'rooms' and d.rooms ~= true then
+      return HTTP.fail(conn, 400, 'rooms_disabled',
+                  'this fetchpoint does not multiplex rooms; PATCH rooms')
+    elseif vspec.needs == 'relay_config' and d.serve_relay_config ~= true then
+      return HTTP.fail(conn, 400, 'relay_config_disabled',
+                  'this name does not hand out a relay list; PATCH serve_relay_config')
     end
 
-    if verb == 'dns' then
+    -- --reflect: the observation that WRITES NOTHING, on every name without
+    -- exception. A redirect reflects too, which is the strongest form of the
+    -- rule and the thing that finally retires system:reflect as a kind. It
+    -- ignores this name's own dimensions on purpose -- the verb is the
+    -- question asked, the row only decides whose counters answer it.
+    if verb == 'reflect' then
+      MT.traffic_bump(row.id, 'reads')
+      return reflect_answer(conn, req, label, d, cfg)
+    end
+
+    -- --open: CLAIM a room rather than have a join imply one (§5.3). The
+    -- difference is that a claimed room can be EMPTY -- an arcade's table
+    -- exists before anyone sits at it, and under the old arrangement a room
+    -- existed only while some peer was fresh, so an empty one was
+    -- inexpressible.
+    --
+    -- The room's policy is durable and its membership is not, which is the
+    -- §2.4 line: this INSERT is everything the database learns.
+    if verb == 'open' then
+      if not ROO.room_allowed(d, cfg, req) then
+        MT.traffic_bump(row.id, 'denied')
+        return HTTP.fail(conn, 403, 'not_allowed',
+                    'the room policy did not admit this request')
+      end
+      local t = C.now()
+      local claimed, code, msg = ROO.room_claim(row.id, {
+        access     = d.access,
+        capacity   = cfg.room_capacity or 16,
+        -- The two clocks, the fetchpoint's own or the defaults it inherits.
+        entry_ttl     = d.entry_ttl or cfg.room_ttl or 300,
+        room_lifetime = d.room_lifetime or 3600,
+        visibility = cfg.room_visibility or 'none',
+      }, t)
+      if not claimed then
+        return HTTP.fail(conn, 503, code, msg)
+      end
+      MT.traffic_bump(row.id, 'rooms_opened')
+      -- 201, and the body carries BOTH names: the uuid is the room and the
+      -- shortcode is only how a human reaches it, which is what lets a
+      -- leaked code be rotated without evicting anyone (§2.2).
+      return HTTP.reply(conn, 201, claimed, ROO.NO_STORE)
+    end
+
+    -- --identify is --dns under a name that says what it does: the same
+    -- observation as --reflect, one bit different, because it writes.
+    if verb == 'identify' or verb == 'dns' then
       -- The dns verb: advertise-by-showing-up. The address is OBSERVED,
       -- never supplied -- the caller cannot claim to be somewhere they are
       -- not making this request from. Only the owner may advertise, proven
@@ -213,20 +368,27 @@ local function serve_fetchpoint(conn, req, label, verb)
       -- the owner's relay allowance, switched on to fix a log line. Both
       -- ends of the first two-network punch failed here (doc/P2P-
       -- CAPABILITY.md 5.2i), which is how it was found.
-      if verb == 'ice' and cfg.ice ~= true then
-        return HTTP.fail(conn, 400, 'ice_disabled',
-                    'this fetchpoint does not serve ice; PATCH config.ice')
-      end
-      if verb == 'outcome' and not (cfg.rooms == true) then
-        return HTTP.fail(conn, 400, 'rooms_disabled',
-                    'this fetchpoint does not multiplex rooms; PATCH config.rooms')
-      end
-      local room = req.query.room or ''
+      -- Both gates moved to the verb registry above, where they read the ROW
+      -- rather than config: --ice needs serve_relay_config, --outcome needs
+      -- only rooms. They shared a gate here, and the cost was that the path
+      -- this product actually ships could not report itself -- a WireGuard
+      -- peer punches, joins, and was then told to switch on a verb that
+      -- hands out TURN credentials against the owner's relay allowance, to
+      -- fix a log line. Both ends of the first two-network punch failed
+      -- exactly here (doc/P2P-CAPABILITY.md 5.2i), which is how it was found.
+
+      -- The room comes from the PATH, and the query is read only as the
+      -- older spelling (SS5.2). A verb host is ours, path and query included,
+      -- but wg_rendezvous.dlua is already in the field asking with ?room=,
+      -- so both are read until its counter says otherwise -- the same SS5.4
+      -- window the superseded verbs get.
+      local room = req.path and req.path:match('^/([^/?]+)') or ''
+      if room == '' then room = req.query.room or '' end
       if room == '' or not ROO.valid_room(room) then
         return HTTP.fail(conn, 400, 'bad_room',
                     '?room= is required: 1-64 letters, digits, hyphens or underscores')
       end
-      if not ROO.room_allowed(cfg, req) then
+      if not ROO.room_allowed(d, cfg, req) then
         MT.traffic_bump(row.id, 'denied')
         local okf, waitf = MT.rate_allow('authfail:' .. row.id, 30, 10)
         if not okf then
@@ -322,7 +484,18 @@ local function serve_fetchpoint(conn, req, label, verb)
     -- WireGuard needs one and this edge cannot observe UDP. Auth is the
     -- room policy the owner configured; capacity and TTL likewise. The
     -- candidate goes to MEMORY and nowhere else -- see the rooms tier.
-    local room = req.query.room or ''
+    -- The room is in the PATH (§5.2): a verb host is ours, path and query
+    -- included, and a user building on a fetchpoint should never have to
+    -- learn which query words we reserved. ?room= is still read, and only
+    -- second, because wg_rendezvous.dlua joins that way today and is fetched
+    -- from the site at install time onto machines we cannot reach (§5.4).
+    local room = req.path and req.path:match('^/([^/?]+)') or ''
+    if room == '' then room = req.query.room or '' end
+    -- CANONICALISE AT THE DOOR (§2.2): lowercase on the way in, so K7F2 and
+    -- k7f2 are one room. A phone keyboard capitalises the first character of
+    -- anything it is given, and without this that is a support ticket from
+    -- someone who typed their code correctly.
+    room = ROO.canon_code(room) or room
     if room ~= '' then
       if not (cfg.rooms == true) then
         return HTTP.fail(conn, 400, 'rooms_disabled',
@@ -333,7 +506,7 @@ local function serve_fetchpoint(conn, req, label, verb)
                     'a room is 1-64 letters, digits, hyphens or underscores')
       end
     end
-    if not ROO.room_allowed(cfg, req) then
+    if not ROO.room_allowed(d, cfg, req) then
       MT.traffic_bump(row.id, 'denied')
       -- Failures spend their OWN, much tighter bucket. The join bucket
       -- below meters admitted work; without this one, wrong-pin guesses
@@ -427,17 +600,94 @@ local function serve_fetchpoint(conn, req, label, verb)
         return HTTP.fail(conn, 400, 'bad_relay', 'relay is the host:port a TURN allocation gave this peer')
       end
     end
-    local entry = { address = addr, port = port, name = cname,
-                    wg_pubkey = wg_pubkey, wg_address = wg_address, relay = relay }
-    if cfg.ice == true then
-      local body = {}
-      if req.body and req.body ~= '' then
-        local okb, decoded = pcall(C.json.decode, req.body)
-        if not okb or type(decoded) ~= 'table' then
-          return HTTP.fail(conn, 400, 'bad_json', 'the body is not a JSON object')
-        end
-        body = decoded
+    -- The body is decoded ONCE, before the ice branch, because endpoints are
+    -- not an ice feature: a plain WireGuard peer has several of them too.
+    local body = {}
+    if req.body and req.body ~= '' then
+      local okb, decoded = pcall(C.json.decode, req.body)
+      if not okb or type(decoded) ~= 'table' then
+        return HTTP.fail(conn, 400, 'bad_json', 'the body is not a JSON object')
       end
+      body = decoded
+    end
+
+    local t = C.now()
+
+    -- ENDPOINTS (§2.1): one peer, many endpoints, each typed by kind AND by
+    -- provenance. This is the cardinality correction -- doc/ICE.md §3 named
+    -- it ("ICE inverts the cardinality: one peer has many candidates") and
+    -- the implementation then kept both cardinalities in one table, keyed
+    -- `u#ufrag` for a peer and `addr#port` for a candidate.
+    --
+    -- The observed one is REFLEXIVE: what the edge saw is what a STUN
+    -- binding would have told this peer about itself, and the peer cannot
+    -- forge it.
+    local endpoints = {}
+    endpoints[#endpoints + 1] = { kind = 'reflexive', source = 'observed',
+                                  address = addr, port = port,
+                                  protocol = 'udp', at = t }
+    if relay then
+      local rh, rp = relay:match('^(.+):(%d+)$')
+      endpoints[#endpoints + 1] = { kind = 'relay', source = 'asserted',
+                                    address = rh, port = tonumber(rp),
+                                    protocol = 'udp', at = t }
+    end
+
+    -- A peer may also ASSERT endpoints it knows about itself -- a host
+    -- candidate is the case that matters, because a LAN address cannot be
+    -- observed from outside and so can only ever be asserted. A peer
+    -- claiming otherwise is the one endpoint lie this validator can catch
+    -- on its own evidence, so it is refused by name rather than recorded
+    -- with a provenance nobody could have produced.
+    if body.endpoints ~= nil then
+      if type(body.endpoints) ~= 'table' then
+        return HTTP.fail(conn, 400, 'bad_endpoints', 'endpoints must be an array')
+      end
+      if #body.endpoints > C.ICE.MAX_CANDIDATES then
+        return HTTP.fail(conn, 400, 'too_many_endpoints',
+                    'at most ' .. C.ICE.MAX_CANDIDATES .. ' endpoints per peer')
+      end
+      for i, e in ipairs(body.endpoints) do
+        if type(e) ~= 'table' or not ROO.ENDPOINT_KINDS[e.kind] then
+          return HTTP.fail(conn, 400, 'bad_endpoint', 'endpoint ' .. i
+            .. ' needs {kind: host|reflexive|relay, address, port, source?, protocol?}')
+        end
+        if e.kind == 'host' and e.source == 'observed' then
+          return HTTP.fail(conn, 400, 'host_is_asserted',
+                      'endpoint ' .. i .. ' is a host endpoint claiming source=observed. '
+                        .. 'A LAN address cannot be seen from outside, so a host '
+                        .. 'endpoint is asserted by construction')
+        end
+        if not LBL.valid_ip(e.address) or type(e.port) ~= 'number'
+           or e.port < 1 or e.port > 65535 or e.port % 1 ~= 0 then
+          return HTTP.fail(conn, 400, 'bad_endpoint', 'endpoint ' .. i
+            .. ' needs an IP literal and a port 1-65535')
+        end
+        endpoints[#endpoints + 1] = { kind = e.kind, source = 'asserted',
+                                      address = e.address, port = e.port,
+                                      protocol = e.protocol == 'tcp' and 'tcp' or 'udp',
+                                      at = t }
+      end
+    end
+
+    -- REPORTED (§2.1): how the peer says the connection went, carried on the
+    -- membership rather than reached through a verb of its own. --outcome
+    -- had to key itself two ways for the same reason the room table did, and
+    -- was gated behind the ice flag, so the path this product actually ships
+    -- could never report itself.
+    local reported = body.reported or req.query.reported
+    if reported ~= nil and not C.ICE.PATHS[reported] then
+      return HTTP.fail(conn, 400, 'bad_reported',
+                  'reported is one of direct, relay, failed')
+    end
+
+    -- The flat fields stay beside the endpoints for the §5.4 window:
+    -- wg_rendezvous.dlua reads `address` off a peer today, and it is fetched
+    -- from the site at install time by machines we cannot reach.
+    local entry = { address = addr, port = port, name = cname,
+                    wg_pubkey = wg_pubkey, wg_address = wg_address, relay = relay,
+                    endpoints = endpoints, reported = reported }
+    if cfg.ice == true then
       local ufrag = body.ufrag or req.query.ufrag
       if ufrag ~= nil then
         local pwd = body.pwd or req.query.pwd
@@ -471,14 +721,37 @@ local function serve_fetchpoint(conn, req, label, verb)
                         'candidate ' .. i .. ' exceeds ' .. C.ICE.MAX_CANDIDATE_BYTES .. ' bytes')
           end
         end
-        entry = { ufrag = ufrag, pwd = pwd, candidates = clean, name = cname,
-                  observed = { address = addr, port = port } }
+        -- The ice session's fields are ADDED to the peer rather than
+        -- replacing it. Rebuilding the entry here is what dropped the
+        -- endpoints and the flat fields on an ice join, and it is the
+        -- same "two shapes in one table" this section exists to end.
+        entry.ufrag, entry.pwd, entry.candidates = ufrag, pwd, clean
+        entry.observed = { address = addr, port = port }
+        -- An ice candidate is a peer ASSERTING an endpoint about itself, so
+        -- each becomes one, typed: srflx and prflx are both reflexive.
+        for _, c in ipairs(clean) do
+          entry.endpoints[#entry.endpoints + 1] = {
+            kind = (c.type == 'host' and 'host')
+                or (c.type == 'relay' and 'relay') or 'reflexive',
+            source = 'asserted', address = c.address, port = c.port,
+            protocol = c.protocol == 'tcp' and 'tcp' or 'udp', at = t }
+        end
       end
     end
-    local t = C.now()
     entry.at = t
-    local ttl = cfg.room_ttl or 300
-    local capacity = cfg.room_capacity or 16
+    -- A CLAIMED room governs its own join (§5.3). --open writes a durable row
+    -- carrying capacity and both clocks, and until this looked it up that row
+    -- was decorative: a join to /k7f2 worked because "k7f2" is a valid room
+    -- NAME, not because the claim resolved, so every policy the claimer chose
+    -- was ignored in favour of the fetchpoint's defaults.
+    --
+    -- Additive on purpose. A path segment that names no claim is the room it
+    -- always was, on the fetchpoint's config -- which is what wg.sh's
+    -- `--room wg` does and what every caller in the field does today.
+    local claimed = ROO.room_by_code(row.id, room, t)
+    local ttl = (claimed and claimed.entry_ttl)
+             or d.entry_ttl or cfg.room_ttl or 300
+    local capacity = (claimed and claimed.capacity) or cfg.room_capacity or 16
     local list, code, msg = ROO.room_join(row.id, room, ttl, capacity, entry, t)
     if not list then
       return HTTP.fail(conn, code == 'rooms_saturated' and 503 or 409, code, msg)
@@ -493,6 +766,11 @@ local function serve_fetchpoint(conn, req, label, verb)
     return HTTP.reply(conn, 200, '{"room":' .. C.json.encode(room)
       .. ',"ttl":' .. ttl
       .. ',"joined":' .. room_entry_json(entry)
+      -- `peers` is the list's real name (§2.1): the members are peers, and
+      -- each carries its own endpoints. `candidates` is the same array under
+      -- the name the field callers already parse, for the §5.4 window --
+      -- one encode, two keys, so the two can never disagree.
+      .. ',"peers":[' .. table.concat(parts, ',') .. ']'
       .. ',"candidates":[' .. table.concat(parts, ',') .. ']}', ROO.PUBLIC_READ)
   end
 
@@ -502,52 +780,7 @@ local function serve_fetchpoint(conn, req, label, verb)
   MT.traffic_bump(row.id, 'reads')
 
   if d.behavior == 'report' and d.subject == 'caller' then
-    local addr = HTTP.observed_address(req)
-
-    -- Text mode: the bare address and a newline, nothing else. This is
-    -- the shape a shell wants -- `ip=$(curl -s https://name/)` -- and
-    -- parsing JSON out of a router's busybox is not a thing to ask of
-    -- anyone. ?format= wins over the configured default in both
-    -- directions, so one name serves a script and a browser alike.
-    local fmt = req.query.format or d.report_format or 'json'
-    if fmt == 'text' then
-      -- No observation is an empty line rather than the word 'nil': the
-      -- consumer is a variable assignment, and an empty one is testable.
-      -- THIS CONTRACT IS FROZEN: the bare address and a newline, nothing
-      -- else, forever -- scripts assign it and it never grows.
-      return HTTP.reply(conn, 200, (addr or '') .. '\n', ROO.PUBLIC_READ, 'text/plain')
-    end
-
-    local prt = HTTP.observed_port(req)
-    if fmt == 'addr-port' then
-      -- ADDRESS PORT and a newline; an empty line when EITHER half is
-      -- unobserved. All-or-nothing on purpose: the consumer is the NAT
-      -- diagnostic parsing two tokens, and half an answer would be
-      -- indistinguishable from a wrong one.
-      local line = (addr and prt) and (addr .. ' ' .. prt) or ''
-      return HTTP.reply(conn, 200, line .. '\n', ROO.PUBLIC_READ, 'text/plain')
-    end
-
-    return HTTP.reply(conn, 200, {
-      service = 'reflect',
-      label = label,
-      observed = { address = addr, port = prt, edge = req.edge,
-                   forwarded = cfg.debug_forwarded and req.forwarded
-                     or HTTP.public_forwarded(req.forwarded) },
-      -- How to measure against this deployment (diluvium-drt #25 §1): the
-      -- STUN pair and the vantage addresses, both as netcheck's own flags
-      -- spell them. Only in the JSON form -- text and addr-port are
-      -- frozen contracts -- and on EVERY name that reports its caller,
-      -- because the measurement is the deployment's, not the canary's.
-      measure = { stun = C.ICE.STUN_HOSTS, vantages = C.ICE.VANTAGES },
-      request = { method = req.method, path = req.path,
-                  query = next(req.query) and req.query or nil },
-      host = req.host,
-      -- Presence only, permanently: reflect echoes what the caller looks
-      -- like, and a credential is not a look.
-      authorization = req.authorization and 'present' or 'absent',
-      at = C.now(),
-    }, ROO.PUBLIC_READ)
+    return reflect_answer(conn, req, label, d, cfg)
   end
 
   -- A report of self, or a redirect to this name's OWN address (the old
@@ -569,7 +802,7 @@ local function serve_fetchpoint(conn, req, label, verb)
                       'a room is 1-64 letters, digits, hyphens or underscores')
         end
       end
-      if not ROO.room_allowed(cfg, req) then
+      if not ROO.room_allowed(d, cfg, req) then
         MT.traffic_bump(row.id, 'denied')
         -- The same failures-only bucket as the join verb: reading a room
         -- with guessed pins is the same brute force through a different

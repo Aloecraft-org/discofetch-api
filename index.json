@@ -6,14 +6,15 @@
       "versions": {
         "0.1.0": {
           "path": "packages/discofetch-api/0.1.0",
-          "manifest": "sha256:6adc177778115328a30626e8038b3a50a6035d3a84f3b876e93294e67451b18f",
-          "package_id": "sha256:ddeaccaf7d1d824d8b5ba1cd770b3e1f4924227bb3cae0b56ee69a183963a543",
-          "code_set": "sha256:39888d4ecc8784d700e30485cca5b91f4886b470b46ce11467645b6cbd482818",
+          "manifest": "sha256:05577d61e377e86272188c9475e182bcb36decc05b234529fc799de2a80aad9a",
+          "package_id": "sha256:e89afba49e2bc11950f083f11c3096ae116f863cec596cc561f8ddd35ba749ba",
+          "code_set": "sha256:0003f0f2b40ca2d9e2efe13187ab98994b6f2e8b9486db7dc23f1fa8b67dffa4",
           "faces": [
             "guest"
           ],
           "runnable": true,
-          "template": false
+          "template": false,
+          "license": "Apache-2.0"
         }
       }
     }

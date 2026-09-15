@@ -11,6 +11,8 @@
 -- Entry points:   M.init(ctx)
 --                 M.validate_config(kind, config, dims)
 --                 M.DIM              the four-dimension namespace
+--                 M.DIM.VERBS        the verb registry, gated by the ROW
+--                 M.DIM.RETIRED_VERBS
 --                 M.KINDS            the kind registry
 --                 M.secret_fields(kind)    M.REDACTED
 --                 M.config_view(req, kind, config)   M.same_config(a, b)
@@ -241,7 +243,69 @@ DIM.FIELDS = {
   redirect_kind = true, redirect_target = true, redirect_status = true,
   report_format = true, published_address = true, published_locked = true,
   serve_relay_config = true, rooms = true, config = true,
+  -- The two clocks (§2.3). Separate fields because one number cannot serve
+  -- both: entry_ttl bounds how long a PEER stays present without re-joining,
+  -- room_lifetime how long an EMPTY room survives. A single TTL makes an
+  -- explicitly created empty room inexpressible -- it vanishes the moment
+  -- its last member goes stale -- and an arcade's empty table must persist
+  -- where a party code must not.
+  entry_ttl = true, room_lifetime = true,
 }
+
+-- Bounds for the fields that are plain integers rather than choices. Stated
+-- as a table so the refusal can name the range it wanted, which is the same
+-- courtesy every other refusal here pays.
+DIM.SPANS = {
+  entry_ttl     = { min = 10,  max = 86400,   what = 'how long a peer stays present without re-joining' },
+  room_lifetime = { min = 60,  max = 2592000, what = 'how long an empty room survives' },
+}
+
+-- The verb registry (§5.1). A verb is a property of the NAME, not of a kind:
+-- `kind.verbs` gated them before, which is what made `system:reflect` a kind
+-- rather than a pair of dimensions. `needs` is read against the ROW, so what
+-- a name can do follows from what it is.
+--
+--   nil             every name, no exception
+--   'observed'      source = observed -- it writes an observation
+--   'rooms'         the name multiplexes rooms
+--   'relay_config'  the name hands out a STUN/TURN list
+--
+-- --probe is deliberately absent: it is served by the edge daemon off
+-- nginx's $host map, never by this registry (§5.1). Declaring it here would
+-- put two authorities on one namespace, and the only symptom of that is an
+-- intermittent 404 on whichever gate disagrees.
+DIM.VERBS = {
+  reflect  = { needs = nil,            does = 'observe the caller and answer' },
+  identify = { needs = 'observed',     does = 'observe the caller and write it' },
+  open     = { needs = 'rooms',        does = 'claim a room, returning its id and code' },
+  join     = { needs = 'rooms',        does = 'enter a room as a member' },
+  ice      = { needs = 'relay_config', does = 'the ice_servers a browser needs' },
+  -- SUPERSEDED, AND STILL ANSWERING. doc/FETCHPOINT-DESIGN.md SS5.4 is the
+  -- rule and it is not a preference: a shape served to a machine we do not
+  -- own runs both ways for a stated window, and is retired on EVIDENCE --
+  -- its counter at zero -- rather than on the day its replacement ships.
+  --
+  -- These two are exactly that case. wg.sh and wg_rendezvous.dlua both call
+  -- --outcome and --join, they are fetched from the site at install time, and
+  -- a device installed last month calls whatever the API is this morning.
+  -- df-advertise.service reaches --dns the same way. There is no version of
+  -- "retire it now" that does not mean a stranger's router going quiet with
+  -- a 404 in a log nobody reads.
+  --
+  -- So they stay, `superseded_by` names what to write instead, and the meter
+  -- counts them apart (MT.traffic_bump on the verb name) so the window can
+  -- close on a fact.
+  dns      = { needs = 'observed', superseded_by = 'identify',
+               does = 'observe the caller and write it (use --identify)' },
+  outcome  = { needs = 'rooms',    superseded_by = 'membership.reported',
+               does = 'report how a punch went (becoming a membership field)' },
+}
+
+-- Verbs with no successor still answering. Empty today and kept because SS5.4
+-- ends with a retirement, not a deprecation: when a superseded verb's counter
+-- has been zero for its window it moves here, and the refusal names what to
+-- write instead rather than only saying no.
+DIM.RETIRED_VERBS = {}
 
 -- Config keys the dimensions REPLACED. Refused by name on a dimension-shaped
 -- body, with the replacement in the sentence, so a client written against
@@ -279,6 +343,20 @@ function DIM.validate(body)
   end
   for _, k in ipairs({ 'access', 'channel', 'behavior' }) do
     if not d[k] then return nil, 'missing_field', k .. ' is required' end
+  end
+
+  -- The spans (§2.3). Whole seconds inside a stated range, and the refusal
+  -- names the range rather than saying no: these two are the numbers an
+  -- owner most often reaches for and most often guesses at.
+  for k, span in pairs(DIM.SPANS) do
+    local v = body[k]
+    if v ~= nil then
+      if type(v) ~= 'number' or v % 1 ~= 0 or v < span.min or v > span.max then
+        return nil, 'invalid_value', k .. ' is ' .. span.what
+          .. ', in whole seconds from ' .. span.min .. ' to ' .. span.max
+      end
+      d[k] = v
+    end
   end
 
   -- report: about whom, and where the address comes from.
@@ -434,16 +512,32 @@ function DIM.of(r)
     published_address = r.published_address,
     redirect_target = r.redirect_target, redirect_status = r.redirect_status,
     report_format = r.report_format,
+    -- The two clocks. Nil when the row predates them, which the room code
+    -- reads as "inherit the default" rather than as zero.
+    entry_ttl = r.entry_ttl, room_lifetime = r.room_lifetime,
   }
   if r.published_locked ~= nil then d.published_locked = (r.published_locked == 1 or r.published_locked == true) end
   if r.serve_relay_config ~= nil then d.serve_relay_config = (r.serve_relay_config == 1 or r.serve_relay_config == true) end
   if d.behavior == nil then
+    -- DERIVED, and the flag is load-bearing rather than informational. What
+    -- follows invents dimensions for a row that never stated any, and an
+    -- invented value must never be read as a decision somebody made. The
+    -- room door is where this bit: every kind-era rendezvous row derives
+    -- access='anyone' -- true of the NAME, anyone may read it -- and a
+    -- reader that took it for the ROOM's policy opened every key-gated room
+    -- on the deployment.
+    d.derived = true
     local k = r.kind
     if k == 'system:reflect' then
       d.behavior, d.subject, d.channel, d.access = 'report', 'caller', 'http', 'anyone'
       d.report_format = cfg.format
     elseif k == 'system:rendezvous' then
       d.subject, d.access = 'self', 'anyone'
+      -- Rooms came with the KIND here: system:rendezvous carried join, ice
+      -- and outcome in its verb table, with nothing in config saying so. The
+      -- verb gate reads the row now, so the implication has to become a
+      -- field or every rendezvous name in the database loses its rooms.
+      d.rooms = true
       d.source   = cfg.address_override and 'asserted' or 'observed'
       d.channel  = cfg.serve == 'dns' and 'both' or 'http'
       d.behavior = cfg.serve == 'redirect' and 'redirect' or 'report'
@@ -464,6 +558,10 @@ function DIM.of(r)
   if d.behavior == 'redirect' then
     d.redirect_kind = d.channel == 'dns' and 'cname' or 'status'
   end
+  -- Rooms still ride in config on a dimension-native row (DIM.FIELDS says so,
+  -- and says it is transitional). Resolved here so the verb gate has ONE
+  -- place to ask, whichever shape the row is in.
+  if d.rooms == nil then d.rooms = (cfg.rooms == true) end
   return d, cfg
 end
 

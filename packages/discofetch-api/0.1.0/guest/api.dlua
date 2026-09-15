@@ -378,6 +378,52 @@ local MIGRATIONS = {
     },
   },
 
+  -- 010 · a room is an object with its own policy. Readable source:
+  -- migrations/010_room.sql, which carries the reasoning.
+  --
+  -- The line this migration either holds or erodes (doc/FETCHPOINT-DESIGN.md
+  -- §2.4): the database knows THAT A ROOM EXISTS AND WHAT ITS RULES ARE, AND
+  -- NOTHING ABOUT WHO IS IN IT. Nothing below has a peer column and nothing
+  -- below may grow one -- membership and endpoints stay in the heap, which
+  -- is the promise, not an optimisation.
+  {
+    version = 10,
+    statements = {
+      -- Keyed by uuid with shortcode SEPARATE and unique per fetchpoint
+      -- (§2.2): a room outlives its code, a collision is a retry rather
+      -- than an error, and a code is reusable once the room is reaped.
+      -- shortcode is nullable because a room nobody types their way into
+      -- has none, and SQLite treats NULLs as distinct in a UNIQUE index.
+      [[CREATE TABLE IF NOT EXISTS room (
+          id             TEXT    PRIMARY KEY,
+          fetchpoint_id  INTEGER NOT NULL,
+          shortcode      TEXT,
+          access         TEXT,
+          capacity       INTEGER,
+          entry_ttl      INTEGER,
+          room_lifetime  INTEGER,
+          visibility     TEXT,
+          created_at     INTEGER NOT NULL,
+          expires_at     INTEGER
+        ) STRICT]],
+      -- The claim's atomicity, and the only check-and-claim the connector
+      -- allows: INSERT and catch the UNIQUE violation, never SELECT then
+      -- INSERT.
+      [[CREATE UNIQUE INDEX IF NOT EXISTS room_code
+          ON room (fetchpoint_id, shortcode)]],
+      [[CREATE INDEX IF NOT EXISTS room_expiry ON room (expires_at)]],
+      -- Two clocks (§2.3), on the fetchpoint, as the defaults its rooms
+      -- inherit. One number cannot serve both: an arcade's empty table must
+      -- persist and a party code must not. SOFT -- see the runner.
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN entry_ttl INTEGER]] },
+      { soft = [[ALTER TABLE fetchpoint ADD COLUMN room_lifetime INTEGER]] },
+      -- The hard half: a soft ALTER that failed because the TABLE was
+      -- missing is skipped as silently as one that failed because the
+      -- column was already there, and this is what tells the two apart.
+      [[SELECT entry_ttl, room_lifetime FROM fetchpoint LIMIT 0]],
+    },
+  },
+
 }
 
 local function migrate()

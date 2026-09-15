@@ -16,6 +16,8 @@
 --                 M.NO_STORE
 --                 M.room_allowed
 --                 M.valid_room
+--                 M.ENDPOINT_KINDS
+--                 M.room_claim   M.room_by_code   M.canon_code
 --                 M.rooms_count
 --
 -- The context is read at CALL time, not at init: `db` is not open when a
@@ -125,15 +127,152 @@ local NO_STORE = { ['cache-control'] = 'no-store' }
 -- Who may join or read a room, per the owner's config. 'open' is the
 -- secret-meeting-id pattern when paired with an unguessable room name;
 -- 'pin' is a human-typeable secret; 'key' is the owner's own credential.
-local function room_allowed(cfg, req)
-  local mode = cfg.room_auth or 'key'
-  if mode == 'open' then return true end
-  if mode == 'pin' then
+-- Who may through a room's door, read from the ACCESS dimension rather than
+-- from cfg.room_auth. The two say the same three things and the dimension
+-- says it on the row, so a name's admission is visible in the same place as
+-- the rest of what it is:
+--
+--   anyone  <- room_auth 'open'   no credential
+--   token   <- room_auth 'key'    the fetchpoint's advertise key
+--   code    <- room_auth 'pin'    a short shared code
+--
+-- cfg is still read, for two reasons and neither is transitional sloppiness:
+-- rows written before the dimensions carry only room_auth (DIM.of maps them,
+-- but an old row with no `access` at all falls through here), and the
+-- credential VALUES -- advertise_key, room_pin -- are config, not dimensions.
+--
+-- The credential is taken from a header first and the query second. SS5.2
+-- moves it to the header permanently, and the query spelling stays for the
+-- window because wg_rendezvous.dlua is in the field sending ?pin= and ?key=
+-- today (SS5.4).
+-- room_auth WINS over the access dimension wherever it is set, and the order
+-- matters more than it looks. DIM.of maps every legacy system:rendezvous row
+-- to access='anyone' -- which is true of the NAME, anyone may read it -- and
+-- reading that as the room's door opens every pin-protected room on the
+-- deployment. api/run.sh caught it as "a wrong pin answered 200". The name's
+-- access and the room's door are two different questions and only the second
+-- one is room_auth.
+local function room_allowed(d, cfg, req)
+  local access
+  if cfg.room_auth ~= nil then
+    local mode = cfg.room_auth
+    access = (mode == 'open' and 'anyone') or (mode == 'pin' and 'code') or 'token'
+  elseif d and d.access and not d.derived then
+    -- A row that STATED its access. Only then is the dimension the door.
+    access = d.access
+  else
+    -- Nothing stated it. 'token' -- the advertise key -- is the old
+    -- `cfg.room_auth or 'key'` default and it is the safe end: a room that
+    -- nobody configured should be shut, not open. Reading a DERIVED access
+    -- here is what silently opened every key-gated legacy room, which is
+    -- the second time this function has been the place that happened.
+    access = 'token'
+  end
+  if access == 'anyone' then return true end
+  if access == 'code' then
+    -- ?pin= only. x-df-pin is what §5.2 wants and it is NOT reachable:
+    -- supervisor builds `req` from named header fields and never sets
+    -- `req.headers`, so reading one here is a mechanism that looks present
+    -- and does nothing. It lands when the listener allowlists the name and
+    -- supervisor carries it.
     return cfg.room_pin ~= nil and req.query.pin == cfg.room_pin
   end
   local key = req.authorization and req.authorization:match('^[Bb]earer%s+(.+)$')
     or req.query.key
   return cfg.advertise_key ~= nil and key == cfg.advertise_key
+end
+
+-- What an endpoint may be, and the vocabulary is ICE's collapsed to three:
+-- srflx and prflx are both "somebody outside told me", which is one fact
+-- about reachability however it was learned. `source` carries the other
+-- half -- observed by us, or asserted by the peer -- and the pair is what
+-- makes a host endpoint claiming `observed` a refusal rather than a row.
+local ENDPOINT_KINDS = { host = true, reflexive = true, relay = true }
+
+-- ── claiming a room (§2.2, §5.3) ───────────────────────────────────────
+--
+-- A room is DURABLE where its membership is not, and this is the whole of
+-- what the database learns: that the room exists and what its rules are.
+--
+-- CANONICALISE AT THE DOOR. Lowercase on the way in, and check uniqueness
+-- against the canonical form, or K7F2 and k7f2 are two rooms -- which is a
+-- support ticket from someone who typed their code correctly into a phone
+-- keyboard that capitalised it.
+local function canon_code(s)
+  if type(s) ~= 'string' then return nil end
+  return (s:lower())
+end
+
+-- 4 symbols over 32 is ~1.05M values, which IS guessable, and the room's own
+-- lifetime is the mitigation (§5.3). That is the Zoom meeting-id trade and it
+-- is a legitimate product; what we owe is informed consent at the moment of
+-- choosing, which is the panel's job, not this function's.
+local SHORTCODE_SYMBOLS = 4
+local CLAIM_ATTEMPTS = 8
+
+-- A uuid the guest can build: crypto/random answers in hex, and v4 is four
+-- fixed bits plus two, so the string is assembled rather than drawn whole.
+local function uuid4(hex)
+  local h = hex:lower()
+  local function seg(i, n) return h:sub(i, i + n - 1) end
+  -- The variant nibble: the two high bits of byte 9 are forced to 10, which
+  -- is what makes this a v4 string rather than 32 random hex digits wearing
+  -- hyphens. The version nibble is the literal '4' below.
+  local variant = string.format('%02x', (tonumber(seg(17, 2), 16) & 0x3f) | 0x80)
+  return seg(1, 8) .. '-' .. seg(9, 4) .. '-4' .. seg(14, 3)
+      .. '-' .. variant .. seg(19, 2) .. '-' .. seg(21, 12)
+end
+
+-- Draw, insert, let the database refuse a duplicate. Never SELECT then
+-- INSERT -- it races with itself, and the UNIQUE index is the only atomicity
+-- available without transactions. The same loop claim_label runs, for the
+-- same reason: at these widths the retry is theatre against collision and
+-- real against two requests drawing in the same instant.
+local function room_claim(fp_id, policy, t)
+  local b32 = 'abcdefghijklmnopqrstuvwxyz234567'
+  for _ = 1, CLAIM_ATTEMPTS do
+    local hex = C.host.crypto.random(16)
+    local id = uuid4(hex)
+    local code = {}
+    local rnd = C.host.crypto.random(SHORTCODE_SYMBOLS)
+    for i = 1, SHORTCODE_SYMBOLS do
+      local byte = tonumber(rnd:sub(i * 2 - 1, i * 2), 16) or 0
+      code[i] = b32:sub((byte % 32) + 1, (byte % 32) + 1)
+    end
+    code = table.concat(code)
+    local expires = policy.room_lifetime and (t + policy.room_lifetime) or nil
+    local res = C.db.try_exec([[INSERT INTO room
+        (id, fetchpoint_id, shortcode, access, capacity, entry_ttl,
+         room_lifetime, visibility, created_at, expires_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)]],
+      id, fp_id, code, policy.access, policy.capacity, policy.entry_ttl,
+      policy.room_lifetime, policy.visibility, t, expires)
+    if res then
+      return { id = id, shortcode = code, access = policy.access,
+               capacity = policy.capacity, entry_ttl = policy.entry_ttl,
+               room_lifetime = policy.room_lifetime,
+               visibility = policy.visibility, expires_at = expires }
+    end
+  end
+  return nil, 'room_code_exhausted',
+         'could not claim a free room code in ' .. CLAIM_ATTEMPTS .. ' attempts'
+end
+
+-- Resolve a code to its room. Canonical form only, and an expired row reads
+-- as absent: a reaper running behind shrinks the live code space temporarily
+-- and never mis-resolves, which is what makes a lazy sweep correct here
+-- rather than merely cheap.
+local function room_by_code(fp_id, code, t)
+  local c = canon_code(code)
+  if not c then return nil end
+  local q = C.db.query([[SELECT id, shortcode, access, capacity, entry_ttl,
+                                room_lifetime, visibility, expires_at
+                           FROM room
+                          WHERE fetchpoint_id = ? AND shortcode = ? LIMIT 1]], fp_id, c)
+  local r = C.rows_by_name(q)[1]
+  if not r then return nil end
+  if r.expires_at and r.expires_at <= t then return nil end
+  return r
 end
 
 local function valid_room(name)
@@ -151,5 +290,9 @@ M.PUBLIC_READ        = PUBLIC_READ
 M.NO_STORE           = NO_STORE
 M.room_allowed       = room_allowed
 M.valid_room         = valid_room
+M.ENDPOINT_KINDS     = ENDPOINT_KINDS
+M.room_claim         = room_claim
+M.room_by_code       = room_by_code
+M.canon_code         = canon_code
 
 return M

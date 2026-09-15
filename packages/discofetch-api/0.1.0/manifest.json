@@ -1,6 +1,7 @@
 {
   "name": "discofetch-api",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "guest": {
     "main": "api",
     "modules": {
@@ -28,16 +29,16 @@
     "diluvium": "2c2f920d7fcfacd72e396e13b8ece5cd11f6d60d"
   },
   "files": {
-    "guest/api.dlua": "sha256:6b9ec527b4b74ff5ba8585c034f421684de898a5d0f8096a77ece24eb7a55482",
-    "guest/df/api.dlua": "sha256:6a39aa0c6275bf146558a8f77ea35f0ef9a35f775d1e13c5c3ef1372666016f4",
+    "guest/api.dlua": "sha256:6515432cd5d7e9f3e90fa8547b133359217402264c758c931452fda12c02880e",
+    "guest/df/api.dlua": "sha256:9b21fba0bdcae2cf0e4591409f1ea4b36b1d6e8c6b41f3d7b71646bd31fb7497",
     "guest/df/event_log.dlua": "sha256:cd572d0abec68e6e95f3027daf49a8772fe09a5ac1fc222884a27a3ed59f4b0e",
-    "guest/df/fetchpoint.dlua": "sha256:057851c36e348ae590361f0314f57b8f06ab13e50cd24e963f13084fdfcb2a88",
+    "guest/df/fetchpoint.dlua": "sha256:7736768e7eba7e6b4d298719bec14f0f45f1499162b6863e983a02e81844f9b9",
     "guest/df/grants.dlua": "sha256:f2be431dc6458e969282b61325a586ed1d47bdaa8cd1ce0423eb140944a92fd4",
     "guest/df/http.dlua": "sha256:b9eb908c5c9c3b25d58b3a29023d71a69e31bae70f198e3d56abd70cee209bdd",
     "guest/df/identity.dlua": "sha256:cb2903875069dce46ccb052c4e716b742ad1c3eb745a0b33f2742db567f7bad1",
     "guest/df/label.dlua": "sha256:d538153d280f06950036fd39b243a07f56586e6f87686e8b0b39bd94110fafc7",
-    "guest/df/meter.dlua": "sha256:8ed6788f69264ef2533673c9efd9166b8d64803f6d608ea8df92cce7fd590339",
-    "guest/df/model.dlua": "sha256:9d3086293d1d9a0dcfc3b974af475555f7ff0dfd544429e3412b0b56ee34cca1",
-    "guest/df/rooms.dlua": "sha256:802a4ff5e7d70df123416d60486f8cd0847aada5d7af3060dfcefae6778862ae"
+    "guest/df/meter.dlua": "sha256:11f9b08996f9f178271529322088c7f9cbb2b6309dca2a1b85191857fcd45be5",
+    "guest/df/model.dlua": "sha256:90ec3dbdf0e81634e0c62703b90220981ce44e5b8479b90c6536c64a7691dddc",
+    "guest/df/rooms.dlua": "sha256:4db6954fc52273bf4ba34f0641e07dd0cc2ad5a9f1a4d686d9ebe2491fd84a45"
   }
 }

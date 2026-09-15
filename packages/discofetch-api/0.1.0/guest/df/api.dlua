@@ -378,7 +378,7 @@ local function fetchpoints_list(req, p)
                           AND (name LIKE ?2 ESCAPE '\' OR label LIKE ?2 ESCAPE '\')]],
                      acct.id, pat).rows[1][1]
     q = C.db.query([[SELECT f.label, f.name, f.kind, f.config, f.created_at, f.updated_at,
-                           f.template AS template, f.source AS source, f.access AS access, f.channel AS channel, f.behavior AS behavior, f.subject AS subject, f.published_address AS published_address, f.published_locked AS published_locked, f.redirect_target AS redirect_target, f.redirect_status AS redirect_status, f.report_format AS report_format, f.serve_relay_config AS serve_relay_config,
+                           f.template AS template, f.source AS source, f.access AS access, f.channel AS channel, f.behavior AS behavior, f.subject AS subject, f.published_address AS published_address, f.published_locked AS published_locked, f.redirect_target AS redirect_target, f.redirect_status AS redirect_status, f.report_format AS report_format, f.serve_relay_config AS serve_relay_config, f.entry_ttl AS entry_ttl, f.room_lifetime AS room_lifetime,
                           a.address AS adv_address, a.at AS adv_at
                      FROM fetchpoint f
                      LEFT JOIN advertisement a ON a.fetchpoint_id = f.id
@@ -391,7 +391,7 @@ local function fetchpoints_list(req, p)
                         WHERE owner_account_id = ? AND deleted_at IS NULL]],
                      acct.id).rows[1][1]
     q = C.db.query([[SELECT f.label, f.name, f.kind, f.config, f.created_at, f.updated_at,
-                           f.template AS template, f.source AS source, f.access AS access, f.channel AS channel, f.behavior AS behavior, f.subject AS subject, f.published_address AS published_address, f.published_locked AS published_locked, f.redirect_target AS redirect_target, f.redirect_status AS redirect_status, f.report_format AS report_format, f.serve_relay_config AS serve_relay_config,
+                           f.template AS template, f.source AS source, f.access AS access, f.channel AS channel, f.behavior AS behavior, f.subject AS subject, f.published_address AS published_address, f.published_locked AS published_locked, f.redirect_target AS redirect_target, f.redirect_status AS redirect_status, f.report_format AS report_format, f.serve_relay_config AS serve_relay_config, f.entry_ttl AS entry_ttl, f.room_lifetime AS room_lifetime,
                           a.address AS adv_address, a.at AS adv_at
                      FROM fetchpoint f
                      LEFT JOIN advertisement a ON a.fetchpoint_id = f.id
@@ -595,6 +595,8 @@ local function fetchpoints_create(req, p)
   put('redirect_status', d.redirect_status)
   put('report_format', d.report_format)
   put('serve_relay_config', d.serve_relay_config)
+  -- The two clocks (§2.3), written like any other dimension column.
+  put('entry_ttl', d.entry_ttl);      put('room_lifetime', d.room_lifetime)
   local marks = {}
   for i = 1, #binds do marks[i] = '?' end
   local res = C.db.exec('INSERT INTO fetchpoint (' .. table.concat(cols, ', ')
@@ -627,7 +629,7 @@ local function fetchpoints_get(req, p)
   local acct, status, payload = resolve_account(req)
   if not acct then return status, payload end
   local q = C.db.query([[SELECT id, label, name, kind, config, created_at, updated_at,
-                              template, source, access, channel, behavior, subject, published_address, published_locked, redirect_target, redirect_status, report_format, serve_relay_config
+                              template, source, access, channel, behavior, subject, published_address, published_locked, redirect_target, redirect_status, report_format, serve_relay_config, entry_ttl, room_lifetime
                          FROM fetchpoint
                         WHERE label = ? AND owner_account_id = ?
                           AND deleted_at IS NULL LIMIT 1]], p.label, acct.id)
@@ -669,7 +671,7 @@ local function fetchpoints_update(req, p)
   local acct, status, payload = resolve_account(req)
   if not acct then return status, payload end
   local q = C.db.query([[SELECT id, label, name, kind, config, created_at, updated_at,
-                              template, source, access, channel, behavior, subject, published_address, published_locked, redirect_target, redirect_status, report_format, serve_relay_config
+                              template, source, access, channel, behavior, subject, published_address, published_locked, redirect_target, redirect_status, report_format, serve_relay_config, entry_ttl, room_lifetime
                          FROM fetchpoint
                         WHERE label = ? AND owner_account_id = ?
                           AND deleted_at IS NULL LIMIT 1]], p.label, acct.id)
@@ -696,8 +698,13 @@ local function fetchpoints_update(req, p)
   -- immutable by the allocator's rule: a name, once issued, is issued. kind
   -- is refused as immutable for now because the dispatcher still gates verbs
   -- on it; the dimensions themselves become PATCHable when it stops.
+  -- The two clocks join the mutable surface (§2.3). They are policy an owner
+  -- tunes after watching real traffic -- how long a peer stays present, how
+  -- long an empty room survives -- and a policy field nobody can change
+  -- without recreating the name is not policy, it is a constructor argument.
   local PATCHABLE = { name = true, config = true, template = true,
-                      published_address = true, published_locked = true }
+                      published_address = true, published_locked = true,
+                      entry_ttl = true, room_lifetime = true }
   for k in pairs(body) do
     if not PATCHABLE[k] then
       local why = (k == 'kind' or k == 'label')
@@ -803,10 +810,25 @@ local function fetchpoints_update(req, p)
     return 400, { error = { code = 'invalid_value',
                             message = 'published_locked is true or false' } }
   end
+  -- The clocks are bounded on the way in here as well as at create. One
+  -- definition, in MDL.DIM.SPANS, so the two doors cannot drift into
+  -- disagreeing about what a legal TTL is.
+  for k, span in pairs(MDL.DIM.SPANS) do
+    local v = body[k]
+    if v ~= nil and (type(v) ~= 'number' or v % 1 ~= 0
+                     or v < span.min or v > span.max) then
+      return 400, { error = { code = 'invalid_value',
+                              message = k .. ' is ' .. span.what
+                                .. ', in whole seconds from ' .. span.min
+                                .. ' to ' .. span.max } }
+    end
+  end
   if body.name == nil and config == nil and body.template == nil
-     and body.published_address == nil and body.published_locked == nil then
+     and body.published_address == nil and body.published_locked == nil
+     and body.entry_ttl == nil and body.room_lifetime == nil then
     return 400, { error = { code = 'nothing_to_change',
-                            message = 'send name, config, template, published_address and/or published_locked' } }
+                            message = 'send name, config, template, published_address, '
+                              .. 'published_locked, entry_ttl and/or room_lifetime' } }
   end
 
   local was = C.json.decode(r.config)
@@ -854,6 +876,11 @@ local function fetchpoints_update(req, p)
   end
   if body.published_locked ~= nil and body.published_locked ~= dims.published_locked then
     moved('published_locked', body.published_locked)
+  end
+  -- The two clocks (§2.3). PATCHable like any other dimension, and validated
+  -- by DIM.validate's spans before reaching here.
+  for _, k in ipairs({ 'entry_ttl', 'room_lifetime' }) do
+    if body[k] ~= nil and body[k] ~= dims[k] then moved(k, body[k]) end
   end
 
   local t = r.updated_at
